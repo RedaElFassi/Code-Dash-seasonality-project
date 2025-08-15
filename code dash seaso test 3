@@ -1,0 +1,361 @@
+import pandas as pd
+import numpy as np
+from datetime import date, datetime
+from calendar import monthrange
+import plotly.graph_objects as go
+from dash import Dash, html, dcc, Input, Output
+
+# -----------------------------
+# Assume data is loaded here (single DataFrame `data` with cols like "France 2Y")
+# -----------------------------
+try:
+    data
+except NameError:
+    try:
+        from data_loader import data
+    except Exception:
+        data = None
+
+# -----------------------------
+# Utilities
+# -----------------------------
+
+def ensure_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df = df.copy()
+        df.index = pd.to_datetime(df.index)
+    return df
+
+def m_bucket(m: int) -> str:
+    return f"{int(m)}Y"
+
+def get_series(country: str, maturity: int, data_df: pd.DataFrame) -> pd.Series:
+    col = f"{country} {m_bucket(maturity)}"
+    df = ensure_datetime_index(data_df)
+    if col not in df.columns:
+        raise KeyError(f"Column '{col}' not found in `data`.")
+    return df[col].astype(float).dropna().rename(col)
+
+def compute_combination(countries, maturities, data_df):
+    # Full logic: 1–3 countries, 1–3 maturities
+    nC = len(countries)
+    nM = len(maturities)
+    if nC == 0 or nM == 0:
+        raise ValueError("Select at least one country and one maturity.")
+    maturities = sorted([int(m) for m in maturities])
+    def m_bucket(m:int) -> str: return f"{int(m)}Y"
+    m_names = [m_bucket(m) for m in maturities]
+
+    if nC == 1:
+        c = countries[0]
+        if nM == 1:
+            s = get_series(c, maturities[0], data_df)
+            return s, f"{c} {m_names[0]} (outright)"
+        if nM == 2:
+            s_long = get_series(c, maturities[1], data_df)
+            s_short = get_series(c, maturities[0], data_df)
+            df = pd.concat([s_long, s_short], axis=1, join="inner").dropna()
+            out = (df.iloc[:,0] - df.iloc[:,1]).rename(f"{c} {m_names[1]} - {m_names[0]}")
+            return out, out.name
+        if nM == 3:
+            s_short = get_series(c, maturities[0], data_df)
+            s_mid   = get_series(c, maturities[1], data_df)
+            s_long  = get_series(c, maturities[2], data_df)
+            df = pd.concat([s_short, s_mid, s_long], axis=1, join="inner").dropna()
+            out = (2*df.iloc[:,1] - df.iloc[:,2] - df.iloc[:,0]).rename(
+                f"2*{c} {m_names[1]} - {c} {m_names[2]} - {c} {m_names[0]}")
+            return out, out.name
+        raise ValueError("With 1 country, select 1 to 3 maturities.")
+
+    if nC == 2:
+        c1, c2 = countries
+        if nM == 1:
+            s1 = get_series(c1, maturities[0], data_df)
+            s2 = get_series(c2, maturities[0], data_df)
+            df = pd.concat([s1, s2], axis=1, join="inner").dropna()
+            higher = df.max(axis=1)
+            lower  = df.min(axis=1)
+            out = (higher - lower).rename(f"max({c1},{c2}) {m_names[0]} - min({c1},{c2}) {m_names[0]}")
+            return out, out.name
+        if nM == 2:
+            mS, mL = maturities[0], maturities[1]
+            s1L, s2L = get_series(c1, mL, data_df), get_series(c2, mL, data_df)
+            s1S, s2S = get_series(c1, mS, data_df), get_series(c2, mS, data_df)
+            df = pd.concat([s1L, s2L, s1S, s2S], axis=1, join="inner").dropna()
+            base_is_c1 = df.iloc[:,0] >= df.iloc[:,1]
+            long_diff  = np.where(base_is_c1, df.iloc[:,0]-df.iloc[:,1], df.iloc[:,1]-df.iloc[:,0])
+            short_diff = np.where(base_is_c1, df.iloc[:,2]-df.iloc[:,3], df.iloc[:,3]-df.iloc[:,2])
+            out = pd.Series(long_diff - short_diff, index=df.index).rename(
+                f"({m_bucket(mL)} diff) - ({m_bucket(mS)} diff) base=argmax long({c1},{c2})")
+            return out, out.name
+        if nM == 3:
+            mS, mM, mL = maturities[0], maturities[1], maturities[2]
+            s1L, s2L = get_series(c1, mL, data_df), get_series(c2, mL, data_df)
+            s1M, s2M = get_series(c1, mM, data_df), get_series(c2, mM, data_df)
+            s1S, s2S = get_series(c1, mS, data_df), get_series(c2, mS, data_df)
+            df = pd.concat([s1L, s2L, s1M, s2M, s1S, s2S], axis=1, join="inner").dropna()
+            base_is_c1 = df.iloc[:,0] >= df.iloc[:,1]
+            long_diff  = np.where(base_is_c1, df.iloc[:,0]-df.iloc[:,1], df.iloc[:,1]-df.iloc[:,0])
+            mid_diff   = np.where(base_is_c1, df.iloc[:,2]-df.iloc[:,3], df.iloc[:,3]-df.iloc[:,2])
+            short_diff = np.where(base_is_c1, df.iloc[:,4]-df.iloc[:,5], df.iloc[:,5]-df.iloc[:,4])
+            out = pd.Series(2*mid_diff - long_diff - short_diff, index=df.index).rename(
+                f"2*({m_bucket(mM)} diff) - ({m_bucket(mL)} diff) - ({m_bucket(mS)} diff) base=argmax long({c1},{c2})")
+            return out, out.name
+        raise ValueError("With 2 countries, select 1 to 3 maturities.")
+
+    if nC == 3:
+        if nM != 1:
+            raise ValueError("With 3 countries, select exactly 1 maturity.")
+        cA, cB, cC = countries
+        m = maturities[0]
+        sA, sB, sC = get_series(cA, m, data_df), get_series(cB, m, data_df), get_series(cC, m, data_df)
+        df = pd.concat([sA, sB, sC], axis=1, join="inner").dropna()
+        arr = df.values
+        high = arr.max(axis=1)
+        low  = arr.min(axis=1)
+        med  = arr.sum(axis=1) - high - low
+        out = pd.Series(2*med - high - low, index=df.index).rename(
+            f"2*Median({cA},{cB},{cC}) {m_bucket(m)} - High - Low")
+        return out, out.name
+
+    raise ValueError("Select between 1 and 3 countries.")
+
+        return s, f"{countries[0]} {maturities[0]}Y"
+    raise NotImplementedError("Only outright case implemented in this minimal example.")
+
+def first_on_or_after(idx: pd.DatetimeIndex, dt: pd.Timestamp | datetime) -> pd.Timestamp | None:
+    dt = pd.Timestamp(dt)
+    pos = idx.searchsorted(dt)
+    if pos < len(idx):
+        return idx[pos]
+    return None
+
+def last_before(idx: pd.DatetimeIndex, dt: pd.Timestamp | datetime) -> pd.Timestamp | None:
+    dt = pd.Timestamp(dt)
+    pos = idx.searchsorted(dt)
+    if pos == 0:
+        return None
+    return idx[pos - 1]
+
+def safe_ymd(y: int, m: int, d: int) -> datetime:
+    last_d = monthrange(y, m)[1]
+    d = min(d, last_d)
+    return datetime(y, m, d)
+
+def slice_window_segment(s: pd.Series, y: int, start_cal: datetime, end_cal: datetime, center_to_zero: bool = True) -> pd.Series:
+    idx = s.index
+    a = first_on_or_after(idx, start_cal)
+    b = last_before(idx, end_cal)
+    if a is None or b is None or a > b:
+        return pd.Series(dtype=float)
+    seg = s.loc[a:b].copy()
+    if center_to_zero and len(seg) > 0:
+        seg = seg - float(seg.iloc[0])
+    return pd.Series(seg.values, index=(seg.index - pd.Timestamp(start_cal)).days)
+
+def build_profiles_current_month(s: pd.Series, years_back: int) -> dict[int, pd.Series]:
+    today = date.today()
+    month_idx = today.month
+    profiles: dict[int, pd.Series] = {}
+    for y in range(today.year - years_back, today.year):
+        start_cal = datetime(y, month_idx, 1)
+        if month_idx == 12:
+            end_cal = datetime(y + 1, 1, 1)
+        else:
+            end_cal = datetime(y, month_idx + 1, 1)
+        seg = slice_window_segment(s, y, start_cal, end_cal, center_to_zero=True)
+        if not seg.empty:
+            profiles[y] = seg
+    return profiles
+
+def build_profiles_anchor_day_next_month(s: pd.Series, years_back: int):
+    today_dt = date.today()
+    day = today_dt.day
+    month = today_dt.month
+    year = today_dt.year
+    if month == 12:
+        title_start = datetime(year, month, min(day, monthrange(year, month)[1])).strftime("%d-%b")
+        title_end = datetime(year + 1, 1, min(day, monthrange(year + 1, 1)[1])).strftime("%d-%b")
+    else:
+        title_start = datetime(year, month, min(day, monthrange(year, month)[1])).strftime("%d-%b")
+        title_end = datetime(year, month + 1, min(day, monthrange(year, month + 1)[1])).strftime("%d-%b")
+    profiles: dict[int, pd.Series] = {}
+    for y in range(year - years_back, year):
+        start_cal = safe_ymd(y, month, day)
+        if month == 12:
+            end_cal = safe_ymd(y + 1, 1, day)
+        else:
+            end_cal = safe_ymd(y, month + 1, day)
+        seg = slice_window_segment(s, y, start_cal, end_cal, center_to_zero=True)
+        if not seg.empty:
+            profiles[y] = seg
+    title_stub = f"{title_start} to {title_end}"
+    return profiles, title_stub
+
+def build_profiles_next_month(s: pd.Series, years_back: int):
+    today = date.today()
+    month = today.month
+    year = today.year
+    if month == 12:
+        start_title = datetime(year + 1, 1, 1)
+        end_title = datetime(year + 1, 2, 1)
+    elif month == 11:
+        start_title = datetime(year, 12, 1)
+        end_title = datetime(year + 1, 1, 1)
+    else:
+        start_title = datetime(year, month + 1, 1)
+        end_title = datetime(year, month + 2, 1)
+    profiles: dict[int, pd.Series] = {}
+    for y in range(year - years_back, year):
+        if month == 12:
+            start_cal = datetime(y + 1, 1, 1)
+            end_cal = datetime(y + 1, 2, 1)
+        elif month == 11:
+            start_cal = datetime(y, 12, 1)
+            end_cal = datetime(y + 1, 1, 1)
+        else:
+            start_cal = datetime(y, month + 1, 1)
+            end_cal = datetime(y, month + 2, 1)
+        seg = slice_window_segment(s, y, start_cal, end_cal, center_to_zero=True)
+        if not seg.empty:
+            profiles[y] = seg
+    title_stub = f"{start_title.strftime('%d-%b')} to {end_title.strftime('%d-%b')}"
+    return profiles, title_stub
+
+# -----------------------------
+# Dash app
+# -----------------------------
+app = Dash(__name__)
+app.layout = html.Div([
+    html.H2("Seasonality Dashboard"),
+    html.Div([
+        html.Div([
+            html.Label("Countries (1)"),
+            dcc.Checklist(
+            id='countries',
+            options=[{'label': c, 'value': c} for c in ["France", "Germany", "Italy", "Spain", "Portugal", "Greece", "Finland", "Belgium"]],
+            value=["France"],
+            inline=False,
+            inputStyle={"marginRight":"6px"},
+            labelStyle={"display":"block"},
+        ),
+        ], style={"width": "30%", "display": "inline-block", "verticalAlign": "top"}),
+        html.Div([
+            html.Label("Maturity (1)"),
+            dcc.Checklist(
+            id='maturities',
+            options=[{'label': str(m), 'value': m} for m in [2,5,7,10,15,20,25,30]],
+            value=[10],
+            inline=False,
+            inputStyle={"marginRight":"6px"},
+            labelStyle={"display":"inline-block"},
+        ), 'value': m} for m in [2,5,7,10,15,20,25,30]], value=10, multi=False),
+        ], style={"width": "30%", "display": "inline-block", "marginLeft": "2%", "verticalAlign": "top"}),
+        html.Div([
+            html.Label("Last N completed years"),
+            dcc.Slider(id='years_back', min=1, max=10, step=1, value=10, marks={i: str(i) for i in range(1,11)}),
+        ], style={"width": "35%", "display": "inline-block", "marginLeft": "2%", "verticalAlign": "top"}),
+    ]),
+    html.Div(id='warning', style={"color":"crimson", "marginTop":"8px"}),
+    html.Hr(),
+    html.H4(id='title_g1'), dcc.Graph(id='graph1'),
+    html.H4(id='title_g2'), dcc.Graph(id='graph2'),
+    html.H4(id='title_g3'), dcc.Graph(id='graph3'),
+])
+
+@app.callback(
+    Output('warning', 'children'),
+    Output('title_g1', 'children'), Output('graph1', 'figure'),
+    Output('title_g2', 'children'), Output('graph2', 'figure'),
+    Output('title_g3', 'children'), Output('graph3', 'figure'),
+    Input('countries', 'value'), Input('maturities', 'value'), Input('years_back', 'value')
+)
+def update_graphs(countries_sel, maturities_sel, years_back):
+    if data is None:
+        return "No data loaded", "", go.Figure(), "", go.Figure(), "", go.Figure()
+    countries_sel = countries_sel or []
+    maturities_sel = maturities_sel or []
+    if len(countries_sel) == 0 or len(maturities_sel) == 0:
+        return "Select at least one country and one maturity", "", go.Figure(), "", go.Figure(), "", go.Figure()
+    if len(countries_sel) > 3:
+        return "Please select at most 3 countries.", "", go.Figure(), "", go.Figure(), "", go.Figure()
+    if len(maturities_sel) > 3:
+        return "Please select at most 3 maturities.", "", go.Figure(), "", go.Figure(), "", go.Figure()
+    if len(countries_sel) == 3 and len(maturities_sel) != 1:
+        return "With 3 countries, select exactly 1 maturity.", "", go.Figure(), "", go.Figure(), "", go.Figure(), "", go.Figure(), "", go.Figure()
+    try:
+        series, label = compute_combination(list(countries_sel), list(map(int, maturities_sel)), data)], data)
+    except Exception as e:
+        return f"Error: {e}", "", go.Figure(), "", go.Figure(), "", go.Figure()
+    series = (series * 100.0).dropna()
+    month_idx = date.today().month
+    month_name = datetime(date.today().year, month_idx, 1).strftime("%B")
+    profiles_1 = build_profiles_current_month(series, int(years_back))
+    fig1 = go.Figure()
+    title1 = f"Seasonality Graph over {int(years_back)} past years: 01-{month_name[:3]} to 01-{(datetime(2000, month_idx % 12 + 1, 1)).strftime('%b')}"
+    max_x1 = 0
+    for y, seg in sorted(profiles_1.items()):
+        fig1.add_trace(go.Scatter(x=seg.index.values, y=seg.values, mode="lines", name=str(y)))
+        if len(seg.index):
+            max_x1 = max(max_x1, int(np.nanmax(seg.index.values)))
+    start_calendar_1 = pd.Timestamp(year=date.today().year, month=month_idx, day=1)
+    tickvals_1 = list(range(0, max_x1 + 1, 5))
+    ticktext_1 = [(start_calendar_1 + pd.Timedelta(days=int(d))).strftime("%d/%m") for d in tickvals_1]
+    fig1.update_layout(yaxis_title="Yield combination (bps)", xaxis=dict(tickmode="array", tickvals=tickvals_1, ticktext=ticktext_1, tickangle=180), template="plotly_white", margin=dict(l=40, r=20, t=40, b=80))
+    profiles_2, title_stub_2 = build_profiles_anchor_day_next_month(series, int(years_back))
+    fig2 = go.Figure()
+    title2 = f"Seasonality Graph over {int(years_back)} past years: {title_stub_2}"
+    today_dt = date.today()
+    start_calendar_2 = pd.Timestamp(year=today_dt.year, month=today_dt.month, day=min(today_dt.day, monthrange(today_dt.year, today_dt.month)[1]))
+    max_x2 = 0
+    for y, seg in sorted(profiles_2.items()):
+        fig2.add_trace(go.Scatter(x=seg.index.values, y=seg.values, mode="lines", name=str(y)))
+        if len(seg.index):
+            max_x2 = max(max_x2, int(np.nanmax(seg.index.values)))
+    tickvals_2 = list(range(0, max_x2 + 1, 5))
+    ticktext_2 = [(start_calendar_2 + pd.Timedelta(days=int(d))).strftime("%d/%m") for d in tickvals_2]
+    fig2.update_layout(yaxis_title="Yield combination (bps)", xaxis=dict(tickmode="array", tickvals=tickvals_2, ticktext=ticktext_2, tickangle=180), template="plotly_white", margin=dict(l=40, r=20, t=40, b=80))
+    profiles_3, title_stub_3 = build_profiles_next_month(series, int(years_back))
+    fig3 = go.Figure()
+    title3 = f"Seasonality Graph over {int(years_back)} past years: {title_stub_3}"
+    tm = date.today().month
+    ty = date.today().year
+    if tm == 12:
+        start_calendar_3 = pd.Timestamp(year=ty + 1, month=1, day=1)
+    else:
+        start_calendar_3 = pd.Timestamp(year=ty, month=tm + 1, day=1)
+    max_x3 = 0
+    for y, seg in sorted(profiles_3.items()):
+        fig3.add_trace(go.Scatter(x=seg.index.values, y=seg.values, mode="lines", name=str(y)))
+        if len(seg.index):
+            max_x3 = max(max_x3, int(np.nanmax(seg.index.values)))
+    tickvals_3 = list(range(0, max_x3 + 1, 5))
+    ticktext_3 = [(start_calendar_3 + pd.Timedelta(days=int(d))).strftime("%d/%m") for d in tickvals_3]
+    fig3.update_layout(yaxis_title="Yield combination (bps)", xaxis=dict(tickmode="array", tickvals=tickvals_3, ticktext=ticktext_3, tickangle=180), template="plotly_white", margin=dict(l=40, r=20, t=40, b=80))
+    return "", title1, fig1, title2, fig2, title3, fig3
+
+if __name__ == "__main__":
+    import webbrowser
+    import socket
+    def get_local_ip():
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+        except Exception:
+            ip = "127.0.0.1"
+        finally:
+            s.close()
+        return ip
+    host = "0.0.0.0"
+    port = 8050
+    local_ip = get_local_ip()
+    print("\n================= SHARE THIS =================")
+    print("Local (you) : http://localhost:{port}".format(port=port))
+    print("LAN (team)  : http://{ip}:{port}".format(ip=local_ip, port=port))
+    print("==============================================\n")
+    try:
+        webbrowser.open("http://localhost:{port}".format(port=port))
+    except Exception:
+        pass
+    app.run_server(host=host, port=port, debug=False)
