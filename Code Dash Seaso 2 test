@@ -309,37 +309,37 @@ def update_graph(countries_sel, maturities_sel, years_back):
 
     # Compute series
     try:
-    series, label = compute_combination(list(countries_sel), list(map(int, maturities_sel)), data)
-    # Convert to basis points (input is in %)
-    series = series * 100.0
-    # Convert to basis points (input is in %)
-    series = series * 100.0)
+        series, label = compute_combination(list(countries_sel), list(map(int, maturities_sel)), data)
     except Exception as e:
         return "", "", f"Error computing series: {e}", go.Figure()
 
-    # Build seasonality profiles
+    # Convert to basis points (inputs are in %)
+    series = series * 100.0
+
+    # Build seasonality profiles for current month
     month_idx = date.today().month
     month_name = datetime(date.today().year, month_idx, 1).strftime("%B")
     profiles = build_intramonth_profiles(series.dropna(), month=month_idx, years_back=int(years_back))
 
+    fig = go.Figure()
     if not profiles:
-        fig = go.Figure()
         fig.update_layout(title=f"No data for {month_name} across selected years")
         return "", f"Current month: {month_name}", label, fig
 
-    # Build figure
-    fig = go.Figure()
+    # Add one line per year and compute max x-offset
     max_x = 0
     for y in sorted(profiles.keys()):
         seg = profiles[y]
         fig.add_trace(go.Scatter(x=seg.index.values, y=seg.values, mode="lines", name=str(y)))
-        if len(seg.index) and int(np.nanmax(seg.index.values)) > max_x:
-            max_x = int(np.nanmax(seg.index.values))
-    # Build tick labels every 5 days from the calendar start of the month
+        if len(seg.index):
+            mx = int(np.nanmax(seg.index.values))
+            if mx > max_x:
+                max_x = mx
+
+    # X ticks every 5 days from calendar start of month (labels as dd/mm)
     start_calendar = pd.Timestamp(year=date.today().year, month=month_idx, day=1)
-     pd.Timestamp(year=date.today().year, month=month_idx, day=1)
     tickvals = list(range(0, max_x + 1, 5))
-    ticktext = [ (start_calendar + pd.Timedelta(days=int(d))).strftime("%d/%m") for d in tickvals ]
+    ticktext = [(start_calendar + pd.Timedelta(days=int(d))).strftime("%d/%m") for d in tickvals]
 
     fig.update_layout(
         title=f"Seasonality — {label} — {month_name}",
@@ -351,10 +351,9 @@ def update_graph(countries_sel, maturities_sel, years_back):
             tickmode="array",
             tickvals=tickvals,
             ticktext=ticktext,
-            tickangle=180
+            tickangle=180,
         ),
         margin=dict(l=40, r=20, t=50, b=80),
-    ),
     )
 
     return "", f"Current month: {month_name}", label, fig
@@ -389,4 +388,5 @@ if __name__ == "__main__":
 
     webbrowser.open(f"http://localhost:{port}")
     app.run_server(host=host, port=port, debug=False)
+
 
