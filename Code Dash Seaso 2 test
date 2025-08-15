@@ -333,10 +333,9 @@ def update_graph(countries_sel, maturities_sel, years_back):
         fig.add_trace(go.Scatter(x=seg.index.values, y=seg.values, mode="lines", name=str(y)))
         if len(seg.index) and int(np.nanmax(seg.index.values)) > max_x:
             max_x = int(np.nanmax(seg.index.values))
-
     # Build tick labels every 5 days from the calendar start of the month
-    import pandas as pd as _pd  # not used; avoid name clash (noop)
     start_calendar = pd.Timestamp(year=date.today().year, month=month_idx, day=1)
+     pd.Timestamp(year=date.today().year, month=month_idx, day=1)
     tickvals = list(range(0, max_x + 1, 5))
     ticktext = [ (start_calendar + pd.Timedelta(days=int(d))).strftime("%d/%m") for d in tickvals ]
 
