@@ -319,21 +319,19 @@ def build_profiles_next_month(s: pd.Series, years_back: int) -> Tuple[Dict[int, 
 
 def build_average_profile(profiles: Dict[int, pd.Series]) -> Optional[pd.Series]:
     """
-    Construit une courbe moyenne sur un axe RELATIF (0,1,2,...) pour garantir un départ à 0.
-    - Pour chaque année: réindexe la série sur range(len(seg)) => jour 0 = premier point (déjà centré à 0)
-    - Concatène en DataFrame et fait la moyenne ligne par ligne (skipna)
-    Retourne une pd.Series avec index = jour relatif (0..Nmax), values = moyenne.
+    Moyenne sur un axe CALENDAIRE (offsets en jours depuis le début de la fenêtre).
+    - On concatène toutes les séries (indices = offsets calendaires entiers).
+    - On fait la moyenne ligne par ligne (skipna) -> couvre jusqu'au max offset présent.
+    - On force l'offset 0 à 0.0 pour partir exactement de 0.
     """
     if not profiles:
         return None
-    rel_dict = {}
-    for y, seg in profiles.items():
-        # seg est déjà centré à 0; on ignore les offsets calendaires pour la moyenne
-        rel_index = np.arange(len(seg), dtype=int)
-        rel_dict[y] = pd.Series(seg.values, index=rel_index)
-    df = pd.concat(rel_dict, axis=1)  # colonnes = années
-    mean_series = df.mean(axis=1, skipna=True)
-    return mean_series
+    df = pd.concat(list(profiles.values()), axis=1)
+    df.columns = list(profiles.keys())
+    avg = df.mean(axis=1, skipna=True)
+    if 0 in avg.index:
+        avg.loc[0] = 0.0
+    return avg.sort_index()
 
 
 # -----------------------------
@@ -464,12 +462,12 @@ def update_graph(countries_sel, maturities_sel, years_back):
         fig1.add_trace(go.Scatter(x=seg.index.values, y=seg.values, mode="lines", name=str(y)))
         if len(seg.index):
             max_x1 = max(max_x1, int(np.nanmax(seg.index.values)))
-    # Courbe moyenne (axe relatif 0..N)
+    # Average (noir)
     avg1 = build_average_profile(profiles_1)
     if avg1 is not None and len(avg1) > 0:
         fig1.add_trace(go.Scatter(
             x=avg1.index.values, y=avg1.values, mode="lines", name="Average",
-            line=dict(width=3)  # épaisse
+            line=dict(width=3, color="black")
         ))
         max_x1 = max(max_x1, int(avg1.index.max()))
     start_calendar_1 = pd.Timestamp(year=date.today().year, month=month_idx, day=1)
@@ -497,12 +495,12 @@ def update_graph(countries_sel, maturities_sel, years_back):
         fig2.add_trace(go.Scatter(x=seg.index.values, y=seg.values, mode="lines", name=str(y)))
         if len(seg.index):
             max_x2 = max(max_x2, int(np.nanmax(seg.index.values)))
-    # Courbe moyenne
+    # Average (noir)
     avg2 = build_average_profile(profiles_2)
     if avg2 is not None and len(avg2) > 0:
         fig2.add_trace(go.Scatter(
             x=avg2.index.values, y=avg2.values, mode="lines", name="Average",
-            line=dict(width=3)
+            line=dict(width=3, color="black")
         ))
         max_x2 = max(max_x2, int(avg2.index.max()))
     tickvals_2 = list(range(0, max_x2 + 1, 5))
@@ -532,12 +530,12 @@ def update_graph(countries_sel, maturities_sel, years_back):
         fig3.add_trace(go.Scatter(x=seg.index.values, y=seg.values, mode="lines", name=str(y)))
         if len(seg.index):
             max_x3 = max(max_x3, int(np.nanmax(seg.index.values)))
-    # Courbe moyenne
+    # Average (noir)
     avg3 = build_average_profile(profiles_3)
     if avg3 is not None and len(avg3) > 0:
         fig3.add_trace(go.Scatter(
             x=avg3.index.values, y=avg3.values, mode="lines", name="Average",
-            line=dict(width=3)
+            line=dict(width=3, color="black")
         ))
         max_x3 = max(max_x3, int(avg3.index.max()))
     tickvals_3 = list(range(0, max_x3 + 1, 5))
@@ -587,3 +585,4 @@ if __name__ == "__main__":
         pass
 
     app.run_server(host=host, port=port, debug=False)
+
