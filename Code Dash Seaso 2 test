@@ -387,3 +387,4 @@ if __name__ == "__main__":
 
     webbrowser.open(f"http://localhost:{port}")
     app.run_server(host=host, port=port, debug=False)
+
