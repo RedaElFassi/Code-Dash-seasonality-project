@@ -309,9 +309,11 @@ def update_graph(countries_sel, maturities_sel, years_back):
 
     # Compute series
     try:
-        series, label = compute_combination(list(countries_sel), list(map(int, maturities_sel)), data)
+    series, label = compute_combination(list(countries_sel), list(map(int, maturities_sel)), data)
     # Convert to basis points (input is in %)
-    series = series * 100.0, list(map(int, maturities_sel)), data)
+    series = series * 100.0
+    # Convert to basis points (input is in %)
+    series = series * 100.0)
     except Exception as e:
         return "", "", f"Error computing series: {e}", go.Figure()
 
