@@ -7,11 +7,12 @@ from datetime import date, datetime
 from typing import Dict, List, Tuple, Optional
 
 """
-Dash app: Yield Seasonality Dashboard
-------------------------------------
-Assumes a dictionary `yield_df` is available/importable with structure:
-    yield_df = {"France": df_France_yield, "Germany": df_Germany_yield, ...}
-Each df: DatetimeIndex (daily), columns like "1Y","2Y",..., numeric yields.
+Dash app: Yield Seasonality Dashboard (single DataFrame input)
+--------------------------------------------------------------
+Assumes a **single DataFrame** named `data` is available/importable with columns like:
+    "France 2Y", "Germany 10Y", ...
+(i.e., f"{Country} {Tenor}", where tenor strings are "1Y","2Y","3Y",...).
+Index must be a DatetimeIndex of daily dates; values are numeric yields.
 
 Logic implemented per spec:
 - 1 country: 1 mat -> outright; 2 -> long-short; 3 -> 2*mid - long - short
@@ -30,7 +31,7 @@ Seasonality plot #1:
 Run locally:
     pip install dash plotly pandas numpy
     python seasonality_dash_app.py
-Then open http://127.0.0.1:8050
+Then open http://127.0.0.1:8050 (or the printed LAN URL)
 """
 
 # -----------------------------
@@ -42,15 +43,15 @@ DEFAULT_COUNTRIES = [
 DEFAULT_MATURITIES = [2, 5, 7, 10, 15, 20, 25, 30]
 
 # -----------------------------
-# Try to locate yield_df in global scope or import from data_loader
+# Try to locate `data` (single DataFrame) in global scope or import from data_loader
 # -----------------------------
 try:
-    yield_df  # type: ignore[name-defined]
+    data  # type: ignore[name-defined]
 except Exception:
     try:
-        from data_loader import yield_df  # type: ignore
+        from data_loader import data  # type: ignore
     except Exception:
-        yield_df = None  # will render a warning in the UI
+        data = None  # will render a warning in the UI
 
 # -----------------------------
 # Utility helpers
@@ -67,12 +68,12 @@ def ensure_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
     return df.sort_index()
 
 
-def get_series(country: str, maturity: int, yld: Dict[str, pd.DataFrame]) -> pd.Series:
-    col = m_bucket(maturity)
-    df = ensure_datetime_index(yld[country])
+def get_series(country: str, maturity: int, data_df: pd.DataFrame) -> pd.Series:
+    col = f"{country} {m_bucket(maturity)}"
+    df = ensure_datetime_index(data_df)
     if col not in df.columns:
-        raise KeyError(f"Column '{col}' not found for {country}.")
-    return df[col].astype(float).dropna().rename(f"{country} {col}")
+        raise KeyError(f"Column '{col}' not found in `data`.")
+    return df[col].astype(float).dropna().rename(col)
 
 
 def align_on_index(series_list: List[pd.Series]) -> pd.DataFrame:
@@ -81,7 +82,7 @@ def align_on_index(series_list: List[pd.Series]) -> pd.DataFrame:
     return df.sort_index()
 
 
-def compute_combination(countries: List[str], maturities: List[int], yld: Dict[str, pd.DataFrame]) -> Tuple[pd.Series, str]:
+def compute_combination(countries: List[str], maturities: List[int], data_df: pd.DataFrame) -> Tuple[pd.Series, str]:
     nC = len(countries)
     nM = len(maturities)
     if nC == 0 or nM == 0:
@@ -92,18 +93,18 @@ def compute_combination(countries: List[str], maturities: List[int], yld: Dict[s
     if nC == 1:
         c = countries[0]
         if nM == 1:
-            s = get_series(c, maturities[0], yld)
+            s = get_series(c, maturities[0], data_df)
             return s, f"{c} {m_names[0]} (outright)"
         if nM == 2:
-            s_long = get_series(c, maturities[1], yld)
-            s_short = get_series(c, maturities[0], yld)
+            s_long = get_series(c, maturities[1], data_df)
+            s_short = get_series(c, maturities[0], data_df)
             df = align_on_index([s_long, s_short])
             out = (df.iloc[:, 0] - df.iloc[:, 1]).rename(f"{c} {m_names[1]} - {m_names[0]}")
             return out, out.name
         if nM == 3:
-            s_short = get_series(c, maturities[0], yld)
-            s_mid   = get_series(c, maturities[1], yld)
-            s_long  = get_series(c, maturities[2], yld)
+            s_short = get_series(c, maturities[0], data_df)
+            s_mid   = get_series(c, maturities[1], data_df)
+            s_long  = get_series(c, maturities[2], data_df)
             df = align_on_index([s_short, s_mid, s_long])
             out = (2*df.iloc[:,1] - df.iloc[:,2] - df.iloc[:,0]).rename(
                 f"2*{c} {m_names[1]} - {c} {m_names[2]} - {c} {m_names[0]}"
@@ -114,8 +115,8 @@ def compute_combination(countries: List[str], maturities: List[int], yld: Dict[s
     if nC == 2:
         c1, c2 = countries
         if nM == 1:
-            s1 = get_series(c1, maturities[0], yld)
-            s2 = get_series(c2, maturities[0], yld)
+            s1 = get_series(c1, maturities[0], data_df)
+            s2 = get_series(c2, maturities[0], data_df)
             df = align_on_index([s1, s2])
             higher = df.max(axis=1)
             lower  = df.min(axis=1)
@@ -123,8 +124,8 @@ def compute_combination(countries: List[str], maturities: List[int], yld: Dict[s
             return out, out.name
         if nM == 2:
             mS, mL = maturities[0], maturities[1]
-            s1L, s2L = get_series(c1, mL, yld), get_series(c2, mL, yld)
-            s1S, s2S = get_series(c1, mS, yld), get_series(c2, mS, yld)
+            s1L, s2L = get_series(c1, mL, data_df), get_series(c2, mL, data_df)
+            s1S, s2S = get_series(c1, mS, data_df), get_series(c2, mS, data_df)
             df = align_on_index([s1L, s2L, s1S, s2S])
             base_is_c1 = df.iloc[:,0] >= df.iloc[:,1]
             long_diff  = np.where(base_is_c1, df.iloc[:,0]-df.iloc[:,1], df.iloc[:,1]-df.iloc[:,0])
@@ -135,9 +136,9 @@ def compute_combination(countries: List[str], maturities: List[int], yld: Dict[s
             return out, out.name
         if nM == 3:
             mS, mM, mL = maturities[0], maturities[1], maturities[2]
-            s1L, s2L = get_series(c1, mL, yld), get_series(c2, mL, yld)
-            s1M, s2M = get_series(c1, mM, yld), get_series(c2, mM, yld)
-            s1S, s2S = get_series(c1, mS, yld), get_series(c2, mS, yld)
+            s1L, s2L = get_series(c1, mL, data_df), get_series(c2, mL, data_df)
+            s1M, s2M = get_series(c1, mM, data_df), get_series(c2, mM, data_df)
+            s1S, s2S = get_series(c1, mS, data_df), get_series(c2, mS, data_df)
             df = align_on_index([s1L, s2L, s1M, s2M, s1S, s2S])
             base_is_c1 = df.iloc[:,0] >= df.iloc[:,1]
             long_diff  = np.where(base_is_c1, df.iloc[:,0]-df.iloc[:,1], df.iloc[:,1]-df.iloc[:,0])
@@ -154,7 +155,7 @@ def compute_combination(countries: List[str], maturities: List[int], yld: Dict[s
             raise ValueError("With 3 countries, select exactly 1 maturity.")
         cA, cB, cC = countries
         m = maturities[0]
-        sA, sB, sC = get_series(cA, m, yld), get_series(cB, m, yld), get_series(cC, m, yld)
+        sA, sB, sC = get_series(cA, m, data_df), get_series(cB, m, data_df), get_series(cC, m, data_df)
         df = align_on_index([sA, sB, sC])
         arr = df.values
         high = arr.max(axis=1)
@@ -226,7 +227,7 @@ app.title = "Seasonality Project"
 
 app.layout = html.Div([
     html.H2("📈 Yield Seasonality Dashboard (Dash)"),
-    html.Div("Configure countries & maturities; the app computes outright/spread/fly then plots current-month seasonality."),
+    html.Div("Single-DataFrame mode: columns like 'France 2Y', 'Germany 10Y'."),
     html.Hr(),
 
     # Warning if no data found
@@ -289,8 +290,8 @@ app.layout = html.Div([
 )
 def update_graph(countries_sel, maturities_sel, years_back):
     # Data availability warning
-    if yield_df is None:
-        warn = "No `yield_df` found. Provide it via a `data_loader.py` or in the global scope."
+    if data is None:
+        warn = "No `data` DataFrame found. Provide it via `data_loader.py` or in the global scope."
         return warn, "", "", go.Figure()
 
     # Validate selections
@@ -307,7 +308,7 @@ def update_graph(countries_sel, maturities_sel, years_back):
 
     # Compute series
     try:
-        series, label = compute_combination(list(countries_sel), list(map(int, maturities_sel)), yield_df)
+        series, label = compute_combination(list(countries_sel), list(map(int, maturities_sel)), data)
     except Exception as e:
         return "", "", f"Error computing series: {e}", go.Figure()
 
@@ -340,14 +341,14 @@ def update_graph(countries_sel, maturities_sel, years_back):
 
 
 if __name__ == "__main__":
+    # Run and share on LAN; open local browser automatically
     import webbrowser
     import socket
 
-    # Trouver automatiquement ton IP locale
     def get_local_ip():
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            s.connect(("8.8.8.8", 80))  # pas de vrai envoi, juste pour savoir l'IP utilisée
+            s.connect(("8.8.8.8", 80))
             ip = s.getsockname()[0]
         except Exception:
             ip = "127.0.0.1"
@@ -355,7 +356,7 @@ if __name__ == "__main__":
             s.close()
         return ip
 
-    host = "0.0.0.0"  # permet l'accès depuis d'autres machines du réseau
+    host = "0.0.0.0"
     port = 8050
     local_ip = get_local_ip()
 
@@ -364,9 +365,6 @@ if __name__ == "__main__":
     print(f"Réseau (équipe): http://{local_ip}:{port}")
     print("==============================================\n")
 
-    # Ouvre automatiquement ton navigateur sur l'URL locale
     webbrowser.open(f"http://localhost:{port}")
-
-    # Lancement du serveur Dash
     app.run_server(host=host, port=port, debug=False)
 
