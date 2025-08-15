@@ -1,33 +1,73 @@
+import dash
+from dash import Dash, dcc, html, Input, Output, State, callback
+import plotly.graph_objs as go
 import pandas as pd
 import numpy as np
 from datetime import date, datetime
-from calendar import monthrange
-import plotly.graph_objects as go
-from dash import Dash, html, dcc, Input, Output
+from typing import Dict, List, Tuple, Optional
+from calendar import monthrange  # <-- ajouté pour gérer le jour du mois suivant
+
+"""
+Dash app: Yield Seasonality Dashboard (single DataFrame input)
+--------------------------------------------------------------
+Assumes a **single DataFrame** named `data` is available/importable with columns like:
+    "France 2Y", "Germany 10Y", ...
+(i.e., f"{Country} {Tenor}", where tenor strings are "1Y","2Y","3Y",...).
+Index must be a DatetimeIndex of daily dates; values are numeric yields.
+
+Logic implemented per spec:
+- 1 country: 1 mat -> outright; 2 -> long-short; 3 -> 2*mid - long - short
+- 2 countries: base = higher LONG maturity each date; then
+    1 mat  -> higher-lower (that mat)
+    2 mats -> (LongDiff - ShortDiff)
+    3 mats -> 2*MidDiff - LongDiff - ShortDiff
+- 3 countries: exactly 1 mat -> cross-country fly = 2*median - high - low
+
+Seasonality plot #1:
+- Current month (e.g., August of today)
+- N last completed years (1..10), default 10
+- For each year, curve from first available trading day ON/AFTER day 1 of month to first
+  available trading day ON/AFTER day 1 of next month. X-axis is day offset from that first day.
+
+Run locally:
+    pip install dash plotly pandas numpy
+    python seasonality_dash_app.py
+Then open http://127.0.0.1:8050 (or the printed LAN URL)
+"""
 
 # -----------------------------
-# Assume data is loaded here (single DataFrame `data` with cols like "France 2Y")
+# Configurable universes
+# -----------------------------
+DEFAULT_COUNTRIES = [
+    "Germany", "France", "Italy", "Spain", "Portugal", "Greece", "Finland", "Belgium"
+]
+DEFAULT_MATURITIES = [2, 5, 7, 10, 15, 20, 25, 30]
+
+# -----------------------------
+# Try to locate `data` (single DataFrame) in global scope or import from data_loader
 # -----------------------------
 try:
-    data
-except NameError:
+    data  # type: ignore[name-defined]
+except Exception:
     try:
-        from data_loader import data
+        from data_loader import data  # type: ignore
     except Exception:
-        data = None
+        data = None  # will render a warning in the UI
 
 # -----------------------------
-# Utilities
+# Utility helpers
 # -----------------------------
+
+def m_bucket(m: int) -> str:
+    return f"{int(m)}Y"
+
 
 def ensure_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
     if not isinstance(df.index, pd.DatetimeIndex):
         df = df.copy()
         df.index = pd.to_datetime(df.index)
-    return df
+    return df.sort_index()
 
-def m_bucket(m: int) -> str:
-    return f"{int(m)}Y"
 
 def get_series(country: str, maturity: int, data_df: pd.DataFrame) -> pd.Series:
     col = f"{country} {m_bucket(maturity)}"
@@ -36,14 +76,19 @@ def get_series(country: str, maturity: int, data_df: pd.DataFrame) -> pd.Series:
         raise KeyError(f"Column '{col}' not found in `data`.")
     return df[col].astype(float).dropna().rename(col)
 
-def compute_combination(countries, maturities, data_df):
-    # Full logic: 1–3 countries, 1–3 maturities
+
+def align_on_index(series_list: List[pd.Series]) -> pd.DataFrame:
+    df = pd.concat(series_list, axis=1, join="inner").dropna(how="any")
+    df.index = pd.to_datetime(df.index)
+    return df.sort_index()
+
+
+def compute_combination(countries: List[str], maturities: List[int], data_df: pd.DataFrame) -> Tuple[pd.Series, str]:
     nC = len(countries)
     nM = len(maturities)
     if nC == 0 or nM == 0:
         raise ValueError("Select at least one country and one maturity.")
-    maturities = sorted([int(m) for m in maturities])
-    def m_bucket(m:int) -> str: return f"{int(m)}Y"
+    maturities = sorted(maturities)
     m_names = [m_bucket(m) for m in maturities]
 
     if nC == 1:
@@ -54,16 +99,17 @@ def compute_combination(countries, maturities, data_df):
         if nM == 2:
             s_long = get_series(c, maturities[1], data_df)
             s_short = get_series(c, maturities[0], data_df)
-            df = pd.concat([s_long, s_short], axis=1, join="inner").dropna()
-            out = (df.iloc[:,0] - df.iloc[:,1]).rename(f"{c} {m_names[1]} - {m_names[0]}")
+            df = align_on_index([s_long, s_short])
+            out = (df.iloc[:, 0] - df.iloc[:, 1]).rename(f"{c} {m_names[1]} - {m_names[0]}")
             return out, out.name
         if nM == 3:
             s_short = get_series(c, maturities[0], data_df)
             s_mid   = get_series(c, maturities[1], data_df)
             s_long  = get_series(c, maturities[2], data_df)
-            df = pd.concat([s_short, s_mid, s_long], axis=1, join="inner").dropna()
+            df = align_on_index([s_short, s_mid, s_long])
             out = (2*df.iloc[:,1] - df.iloc[:,2] - df.iloc[:,0]).rename(
-                f"2*{c} {m_names[1]} - {c} {m_names[2]} - {c} {m_names[0]}")
+                f"2*{c} {m_names[1]} - {c} {m_names[2]} - {c} {m_names[0]}"
+            )
             return out, out.name
         raise ValueError("With 1 country, select 1 to 3 maturities.")
 
@@ -72,7 +118,7 @@ def compute_combination(countries, maturities, data_df):
         if nM == 1:
             s1 = get_series(c1, maturities[0], data_df)
             s2 = get_series(c2, maturities[0], data_df)
-            df = pd.concat([s1, s2], axis=1, join="inner").dropna()
+            df = align_on_index([s1, s2])
             higher = df.max(axis=1)
             lower  = df.min(axis=1)
             out = (higher - lower).rename(f"max({c1},{c2}) {m_names[0]} - min({c1},{c2}) {m_names[0]}")
@@ -81,25 +127,27 @@ def compute_combination(countries, maturities, data_df):
             mS, mL = maturities[0], maturities[1]
             s1L, s2L = get_series(c1, mL, data_df), get_series(c2, mL, data_df)
             s1S, s2S = get_series(c1, mS, data_df), get_series(c2, mS, data_df)
-            df = pd.concat([s1L, s2L, s1S, s2S], axis=1, join="inner").dropna()
+            df = align_on_index([s1L, s2L, s1S, s2S])
             base_is_c1 = df.iloc[:,0] >= df.iloc[:,1]
             long_diff  = np.where(base_is_c1, df.iloc[:,0]-df.iloc[:,1], df.iloc[:,1]-df.iloc[:,0])
             short_diff = np.where(base_is_c1, df.iloc[:,2]-df.iloc[:,3], df.iloc[:,3]-df.iloc[:,2])
             out = pd.Series(long_diff - short_diff, index=df.index).rename(
-                f"({m_bucket(mL)} diff) - ({m_bucket(mS)} diff) base=argmax long({c1},{c2})")
+                f"({m_bucket(mL)} diff) - ({m_bucket(mS)} diff) base=argmax long({c1},{c2})"
+            )
             return out, out.name
         if nM == 3:
             mS, mM, mL = maturities[0], maturities[1], maturities[2]
             s1L, s2L = get_series(c1, mL, data_df), get_series(c2, mL, data_df)
             s1M, s2M = get_series(c1, mM, data_df), get_series(c2, mM, data_df)
             s1S, s2S = get_series(c1, mS, data_df), get_series(c2, mS, data_df)
-            df = pd.concat([s1L, s2L, s1M, s2M, s1S, s2S], axis=1, join="inner").dropna()
+            df = align_on_index([s1L, s2L, s1M, s2M, s1S, s2S])
             base_is_c1 = df.iloc[:,0] >= df.iloc[:,1]
             long_diff  = np.where(base_is_c1, df.iloc[:,0]-df.iloc[:,1], df.iloc[:,1]-df.iloc[:,0])
             mid_diff   = np.where(base_is_c1, df.iloc[:,2]-df.iloc[:,3], df.iloc[:,3]-df.iloc[:,2])
             short_diff = np.where(base_is_c1, df.iloc[:,4]-df.iloc[:,5], df.iloc[:,5]-df.iloc[:,4])
             out = pd.Series(2*mid_diff - long_diff - short_diff, index=df.index).rename(
-                f"2*({m_bucket(mM)} diff) - ({m_bucket(mL)} diff) - ({m_bucket(mS)} diff) base=argmax long({c1},{c2})")
+                f"2*({m_bucket(mM)} diff) - ({m_bucket(mL)} diff) - ({m_bucket(mS)} diff) base=argmax long({c1},{c2})"
+            )
             return out, out.name
         raise ValueError("With 2 countries, select 1 to 3 maturities.")
 
@@ -109,43 +157,87 @@ def compute_combination(countries, maturities, data_df):
         cA, cB, cC = countries
         m = maturities[0]
         sA, sB, sC = get_series(cA, m, data_df), get_series(cB, m, data_df), get_series(cC, m, data_df)
-        df = pd.concat([sA, sB, sC], axis=1, join="inner").dropna()
+        df = align_on_index([sA, sB, sC])
         arr = df.values
         high = arr.max(axis=1)
         low  = arr.min(axis=1)
         med  = arr.sum(axis=1) - high - low
         out = pd.Series(2*med - high - low, index=df.index).rename(
-            f"2*Median({cA},{cB},{cC}) {m_bucket(m)} - High - Low")
+            f"2*Median({cA},{cB},{cC}) {m_bucket(m)} - High - Low"
+        )
         return out, out.name
 
     raise ValueError("Select between 1 and 3 countries.")
 
-        return s, f"{countries[0]} {maturities[0]}Y"
-    raise NotImplementedError("Only outright case implemented in this minimal example.")
 
-def first_on_or_after(idx: pd.DatetimeIndex, dt: pd.Timestamp | datetime) -> pd.Timestamp | None:
-    dt = pd.Timestamp(dt)
+# -----------------------------
+# Seasonality helpers (Graph 1 = current month 01->01)
+# -----------------------------
+
+def month_window_for_year(year: int, month: int) -> Tuple[pd.Timestamp, pd.Timestamp]:
+    start = pd.Timestamp(year=year, month=month, day=1)
+    end = pd.Timestamp(year=year+1, month=1, day=1) if month == 12 else pd.Timestamp(year=year, month=month+1, day=1)
+    return start, end
+
+
+def first_on_or_after(idx: pd.DatetimeIndex, dt: pd.Timestamp) -> Optional[pd.Timestamp]:
     pos = idx.searchsorted(dt)
     if pos < len(idx):
         return idx[pos]
     return None
 
-def last_before(idx: pd.DatetimeIndex, dt: pd.Timestamp | datetime) -> pd.Timestamp | None:
-    dt = pd.Timestamp(dt)
+
+def last_before(idx: pd.DatetimeIndex, dt: pd.Timestamp) -> Optional[pd.Timestamp]:
     pos = idx.searchsorted(dt)
     if pos == 0:
         return None
-    return idx[pos - 1]
+    return idx[pos-1]
+
+
+def slice_month_segment(s: pd.Series, year: int, month: int) -> pd.Series:
+    idx = s.index
+    start_month, end_month = month_window_for_year(year, month)
+    a = first_on_or_after(idx, start_month)
+    b = last_before(idx, end_month)
+    if a is None or b is None or a > b:
+        return pd.Series(dtype=float)
+    seg = s.loc[a:b].copy()
+    # Normalize so each year's segment starts at 0 (subtract first trading day's value)
+    start_val = float(seg.iloc[0])
+    seg = seg - start_val
+    # X-axis index as offsets from CALENDAR 1st-of-month, so ticks can be 01/MM, 06/MM, ...
+    return pd.Series(seg.values, index=(seg.index - start_month).days)
+
+
+def build_intramonth_profiles(s: pd.Series, month: int, years_back: int) -> Dict[int, pd.Series]:
+    if s.empty:
+        return {}
+    current_year = date.today().year
+    years = list(range(current_year - 1, current_year - years_back - 1, -1))
+    profiles: Dict[int, pd.Series] = {}
+    for y in sorted(years):
+        seg = slice_month_segment(s, y, month)
+        if not seg.empty:
+            profiles[y] = seg
+    return profiles
+
+
+# -----------------------------
+# New helpers for Graph 2 & Graph 3
+# -----------------------------
 
 def safe_ymd(y: int, m: int, d: int) -> datetime:
+    """Clamp day to last day of month if needed (handles 29/30/31 issues)."""
     last_d = monthrange(y, m)[1]
     d = min(d, last_d)
     return datetime(y, m, d)
 
-def slice_window_segment(s: pd.Series, y: int, start_cal: datetime, end_cal: datetime, center_to_zero: bool = True) -> pd.Series:
+
+def slice_window_segment(s: pd.Series, start_cal: datetime, end_cal: datetime, center_to_zero: bool = True) -> pd.Series:
+    """Generic slicer from calendar start -> end, adjusted to available trading days."""
     idx = s.index
-    a = first_on_or_after(idx, start_cal)
-    b = last_before(idx, end_cal)
+    a = first_on_or_after(idx, pd.Timestamp(start_cal))
+    b = last_before(idx, pd.Timestamp(end_cal))
     if a is None or b is None or a > b:
         return pd.Series(dtype=float)
     seg = s.loc[a:b].copy()
@@ -153,160 +245,226 @@ def slice_window_segment(s: pd.Series, y: int, start_cal: datetime, end_cal: dat
         seg = seg - float(seg.iloc[0])
     return pd.Series(seg.values, index=(seg.index - pd.Timestamp(start_cal)).days)
 
-def build_profiles_current_month(s: pd.Series, years_back: int) -> dict[int, pd.Series]:
-    today = date.today()
-    month_idx = today.month
-    profiles: dict[int, pd.Series] = {}
-    for y in range(today.year - years_back, today.year):
-        start_cal = datetime(y, month_idx, 1)
-        if month_idx == 12:
-            end_cal = datetime(y + 1, 1, 1)
-        else:
-            end_cal = datetime(y, month_idx + 1, 1)
-        seg = slice_window_segment(s, y, start_cal, end_cal, center_to_zero=True)
-        if not seg.empty:
-            profiles[y] = seg
-    return profiles
 
-def build_profiles_anchor_day_next_month(s: pd.Series, years_back: int):
+def build_profiles_anchor_day_next_month(s: pd.Series, years_back: int) -> Tuple[Dict[int, pd.Series], str]:
+    """
+    Graph 2: For each past year y, slice [same day-of-month of current month (year y)] -> [same day-of-month next month (year y)].
+    Example if today is 15-Aug-2025: we plot, for y in [2015..2024], the windows [15-Aug-y -> 15-Sep-y].
+    Returns (profiles, title_stub like "15-Aug to 15-Sep").
+    """
     today_dt = date.today()
     day = today_dt.day
     month = today_dt.month
     year = today_dt.year
+
+    # Title stub for display (no year)
     if month == 12:
         title_start = datetime(year, month, min(day, monthrange(year, month)[1])).strftime("%d-%b")
-        title_end = datetime(year + 1, 1, min(day, monthrange(year + 1, 1)[1])).strftime("%d-%b")
+        title_end   = datetime(year + 1, 1, min(day, monthrange(year + 1, 1)[1])).strftime("%d-%b")
     else:
         title_start = datetime(year, month, min(day, monthrange(year, month)[1])).strftime("%d-%b")
-        title_end = datetime(year, month + 1, min(day, monthrange(year, month + 1)[1])).strftime("%d-%b")
-    profiles: dict[int, pd.Series] = {}
+        title_end   = datetime(year, month + 1, min(day, monthrange(year, month + 1)[1])).strftime("%d-%b")
+
+    profiles: Dict[int, pd.Series] = {}
     for y in range(year - years_back, year):
         start_cal = safe_ymd(y, month, day)
         if month == 12:
             end_cal = safe_ymd(y + 1, 1, day)
         else:
             end_cal = safe_ymd(y, month + 1, day)
-        seg = slice_window_segment(s, y, start_cal, end_cal, center_to_zero=True)
+        seg = slice_window_segment(s, start_cal, end_cal, center_to_zero=True)
         if not seg.empty:
             profiles[y] = seg
-    title_stub = f"{title_start} to {title_end}"
-    return profiles, title_stub
 
-def build_profiles_next_month(s: pd.Series, years_back: int):
+    return profiles, f"{title_start} to {title_end}"
+
+
+def build_profiles_next_month(s: pd.Series, years_back: int) -> Tuple[Dict[int, pd.Series], str]:
+    """
+    Graph 3: Next month window 01-next-month -> 01-month+2, for each past year y.
+    Example if today = Aug: use [01-Sep-y -> 01-Oct-y].
+    """
     today = date.today()
     month = today.month
     year = today.year
+
+    # For display (current-year pretty title only)
     if month == 12:
         start_title = datetime(year + 1, 1, 1)
-        end_title = datetime(year + 1, 2, 1)
+        end_title   = datetime(year + 1, 2, 1)
     elif month == 11:
         start_title = datetime(year, 12, 1)
-        end_title = datetime(year + 1, 1, 1)
+        end_title   = datetime(year + 1, 1, 1)
     else:
         start_title = datetime(year, month + 1, 1)
-        end_title = datetime(year, month + 2, 1)
-    profiles: dict[int, pd.Series] = {}
+        end_title   = datetime(year, month + 2, 1)
+
+    profiles: Dict[int, pd.Series] = {}
     for y in range(year - years_back, year):
         if month == 12:
             start_cal = datetime(y + 1, 1, 1)
-            end_cal = datetime(y + 1, 2, 1)
+            end_cal   = datetime(y + 1, 2, 1)
         elif month == 11:
             start_cal = datetime(y, 12, 1)
-            end_cal = datetime(y + 1, 1, 1)
+            end_cal   = datetime(y + 1, 1, 1)
         else:
             start_cal = datetime(y, month + 1, 1)
-            end_cal = datetime(y, month + 2, 1)
-        seg = slice_window_segment(s, y, start_cal, end_cal, center_to_zero=True)
+            end_cal   = datetime(y, month + 2, 1)
+        seg = slice_window_segment(s, start_cal, end_cal, center_to_zero=True)
         if not seg.empty:
             profiles[y] = seg
-    title_stub = f"{start_title.strftime('%d-%b')} to {end_title.strftime('%d-%b')}"
-    return profiles, title_stub
+
+    return profiles, f"{start_title.strftime('%d-%b')} to {end_title.strftime('%d-%b')}"
+
 
 # -----------------------------
-# Dash app
+# Build Dash layout
 # -----------------------------
-app = Dash(__name__)
+app: Dash = dash.Dash(__name__)
+app.title = "Seasonality Project"
+
 app.layout = html.Div([
-    html.H2("Seasonality Dashboard"),
+    html.H2("📈 Yield Seasonality Dashboard (Dash)"),
+    html.Hr(),
+
+    # Warning if no data found
+    html.Div(id="data-warning", style={"color": "crimson", "marginBottom": "10px"}),
+
     html.Div([
         html.Div([
-            html.Label("Countries (1)"),
+            html.Label("Countries (1–3)"),
             dcc.Checklist(
-            id='countries',
-            options=[{'label': c, 'value': c} for c in ["France", "Germany", "Italy", "Spain", "Portugal", "Greece", "Finland", "Belgium"]],
-            value=["France"],
-            inline=False,
-            inputStyle={"marginRight":"6px"},
-            labelStyle={"display":"block"},
-        ),
+                id="countries",
+                options=[{"label": c, "value": c} for c in DEFAULT_COUNTRIES],
+                value=["France"],
+                inline=False,
+                inputStyle={"marginRight": "6px"},
+                labelStyle={"display": "block"},
+            ),
         ], style={"width": "30%", "display": "inline-block", "verticalAlign": "top"}),
+
         html.Div([
-            html.Label("Maturity (1)"),
+            html.Label("Maturities (1–3)"),
             dcc.Checklist(
-            id='maturities',
-            options=[{'label': str(m), 'value': m} for m in [2,5,7,10,15,20,25,30]],
-            value=[10],
-            inline=False,
-            inputStyle={"marginRight":"6px"},
-            labelStyle={"display":"inline-block"},
-        ), 'value': m} for m in [2,5,7,10,15,20,25,30]], value=10, multi=False),
+                id="maturities",
+                options=[{"label": str(m), "value": m} for m in DEFAULT_MATURITIES],
+                value=[10],
+                inline=False,
+                inputStyle={"marginRight": "6px"},
+                labelStyle={"display": "inline-block"},
+            ),
         ], style={"width": "30%", "display": "inline-block", "marginLeft": "2%", "verticalAlign": "top"}),
+
         html.Div([
             html.Label("Last N completed years"),
-            dcc.Slider(id='years_back', min=1, max=10, step=1, value=10, marks={i: str(i) for i in range(1,11)}),
+            dcc.Slider(id="years-back", min=1, max=10, step=1, value=10,
+                       marks={i: str(i) for i in range(1, 11)}),
+            html.Div(id="current-month", style={"marginTop": "10px"}),
         ], style={"width": "35%", "display": "inline-block", "marginLeft": "2%", "verticalAlign": "top"}),
     ]),
-    html.Div(id='warning', style={"color":"crimson", "marginTop":"8px"}),
+
     html.Hr(),
-    html.H4(id='title_g1'), dcc.Graph(id='graph1'),
-    html.H4(id='title_g2'), dcc.Graph(id='graph2'),
-    html.H4(id='title_g3'), dcc.Graph(id='graph3'),
+    html.H4("Constructed series"),
+    html.Div(id="series-label", style={"fontStyle": "italic", "marginBottom": "10px"}),
+
+    # ---- Graph 1 title + figure ----
+    html.H4(id="title_g1"),
+    dcc.Graph(id="seasonality-graph", config={"displaylogo": False}),
+
+    # ---- Graph 2 title + figure (today -> today+1M for each past year) ----
+    html.H4(id="title_g2"),
+    dcc.Graph(id="graph2", config={"displaylogo": False}),
+
+    # ---- Graph 3 title + figure (next month 01->01 for each past year) ----
+    html.H4(id="title_g3"),
+    dcc.Graph(id="graph3", config={"displaylogo": False}),
 ])
 
-@app.callback(
-    Output('warning', 'children'),
-    Output('title_g1', 'children'), Output('graph1', 'figure'),
-    Output('title_g2', 'children'), Output('graph2', 'figure'),
-    Output('title_g3', 'children'), Output('graph3', 'figure'),
-    Input('countries', 'value'), Input('maturities', 'value'), Input('years_back', 'value')
+
+# -----------------------------
+# Callbacks
+# -----------------------------
+@callback(
+    Output("data-warning", "children"),
+    Output("current-month", "children"),
+    Output("series-label", "children"),
+    Output("title_g1", "children"),
+    Output("seasonality-graph", "figure"),
+    Output("title_g2", "children"),
+    Output("graph2", "figure"),
+    Output("title_g3", "children"),
+    Output("graph3", "figure"),
+    Input("countries", "value"),
+    Input("maturities", "value"),
+    Input("years-back", "value"),
 )
-def update_graphs(countries_sel, maturities_sel, years_back):
+def update_graph(countries_sel, maturities_sel, years_back):
+    # Data availability warning
     if data is None:
-        return "No data loaded", "", go.Figure(), "", go.Figure(), "", go.Figure()
+        warn = "No `data` DataFrame found. Provide it via `data_loader.py` or in the global scope."
+        empty = go.Figure()
+        return warn, "", "", "", empty, "", empty, "", empty
+
+    # Validate selections
     countries_sel = countries_sel or []
     maturities_sel = maturities_sel or []
     if len(countries_sel) == 0 or len(maturities_sel) == 0:
-        return "Select at least one country and one maturity", "", go.Figure(), "", go.Figure(), "", go.Figure()
+        empty = go.Figure()
+        return "", "", "Select at least one country and one maturity.", "", empty, "", empty, "", empty
     if len(countries_sel) > 3:
-        return "Please select at most 3 countries.", "", go.Figure(), "", go.Figure(), "", go.Figure()
+        empty = go.Figure()
+        return "", "", "Please select at most 3 countries.", "", empty, "", empty, "", empty
     if len(maturities_sel) > 3:
-        return "Please select at most 3 maturities.", "", go.Figure(), "", go.Figure(), "", go.Figure()
+        empty = go.Figure()
+        return "", "", "Please select at most 3 maturities.", "", empty, "", empty, "", empty
     if len(countries_sel) == 3 and len(maturities_sel) != 1:
-        return "With 3 countries, select exactly 1 maturity.", "", go.Figure(), "", go.Figure(), "", go.Figure(), "", go.Figure(), "", go.Figure()
+        empty = go.Figure()
+        return "", "", "With 3 countries, select exactly 1 maturity.", "", empty, "", empty, "", empty
+
+    # Compute series
     try:
-        series, label = compute_combination(list(countries_sel), list(map(int, maturities_sel)), data)], data)
+        series, label = compute_combination(list(countries_sel), list(map(int, maturities_sel)), data)
     except Exception as e:
-        return f"Error: {e}", "", go.Figure(), "", go.Figure(), "", go.Figure()
+        empty = go.Figure()
+        return "", "", f"Error computing series: {e}", "", empty, "", empty, "", empty
+
+    # Convert to basis points (inputs are in %)
     series = (series * 100.0).dropna()
+
+    # ---------- Graph 1: current month (01-M to 01-M+1) ----------
     month_idx = date.today().month
-    month_name = datetime(date.today().year, month_idx, 1).strftime("%B")
-    profiles_1 = build_profiles_current_month(series, int(years_back))
+    month_name_short = datetime(date.today().year, month_idx, 1).strftime("%b")
+    next_month_short = (datetime(2000, month_idx % 12 + 1, 1)).strftime("%b")  # only for label
+    profiles_1 = build_intramonth_profiles(series, month=month_idx, years_back=int(years_back))
+
     fig1 = go.Figure()
-    title1 = f"Seasonality Graph over {int(years_back)} past years: 01-{month_name[:3]} to 01-{(datetime(2000, month_idx % 12 + 1, 1)).strftime('%b')}"
+    title1 = f"Seasonality Graph over {int(years_back)} past years: 01-{month_name_short} to 01-{next_month_short}"
     max_x1 = 0
-    for y, seg in sorted(profiles_1.items()):
+    for y in sorted(profiles_1.keys()):
+        seg = profiles_1[y]
         fig1.add_trace(go.Scatter(x=seg.index.values, y=seg.values, mode="lines", name=str(y)))
         if len(seg.index):
             max_x1 = max(max_x1, int(np.nanmax(seg.index.values)))
     start_calendar_1 = pd.Timestamp(year=date.today().year, month=month_idx, day=1)
     tickvals_1 = list(range(0, max_x1 + 1, 5))
     ticktext_1 = [(start_calendar_1 + pd.Timedelta(days=int(d))).strftime("%d/%m") for d in tickvals_1]
-    fig1.update_layout(yaxis_title="Yield combination (bps)", xaxis=dict(tickmode="array", tickvals=tickvals_1, ticktext=ticktext_1, tickangle=180), template="plotly_white", margin=dict(l=40, r=20, t=40, b=80))
+    fig1.update_layout(
+        xaxis_title="",
+        yaxis_title="Yield combination (bps)",
+        legend_title="Year",
+        template="plotly_white",
+        xaxis=dict(tickmode="array", tickvals=tickvals_1, ticktext=ticktext_1, tickangle=180),
+        margin=dict(l=40, r=20, t=40, b=80),
+    )
+
+    # ---------- Graph 2: anchor today (same day-of-month) -> next month (per past year) ----------
     profiles_2, title_stub_2 = build_profiles_anchor_day_next_month(series, int(years_back))
     fig2 = go.Figure()
     title2 = f"Seasonality Graph over {int(years_back)} past years: {title_stub_2}"
+
     today_dt = date.today()
-    start_calendar_2 = pd.Timestamp(year=today_dt.year, month=today_dt.month, day=min(today_dt.day, monthrange(today_dt.year, today_dt.month)[1]))
+    start_calendar_2 = pd.Timestamp(year=today_dt.year, month=today_dt.month,
+                                    day=min(today_dt.day, monthrange(today_dt.year, today_dt.month)[1]))
     max_x2 = 0
     for y, seg in sorted(profiles_2.items()):
         fig2.add_trace(go.Scatter(x=seg.index.values, y=seg.values, mode="lines", name=str(y)))
@@ -314,10 +472,20 @@ def update_graphs(countries_sel, maturities_sel, years_back):
             max_x2 = max(max_x2, int(np.nanmax(seg.index.values)))
     tickvals_2 = list(range(0, max_x2 + 1, 5))
     ticktext_2 = [(start_calendar_2 + pd.Timedelta(days=int(d))).strftime("%d/%m") for d in tickvals_2]
-    fig2.update_layout(yaxis_title="Yield combination (bps)", xaxis=dict(tickmode="array", tickvals=tickvals_2, ticktext=ticktext_2, tickangle=180), template="plotly_white", margin=dict(l=40, r=20, t=40, b=80))
+    fig2.update_layout(
+        xaxis_title="",
+        yaxis_title="Yield combination (bps)",
+        legend_title="Year",
+        template="plotly_white",
+        xaxis=dict(tickmode="array", tickvals=tickvals_2, ticktext=ticktext_2, tickangle=180),
+        margin=dict(l=40, r=20, t=40, b=80),
+    )
+
+    # ---------- Graph 3: next month 01 -> 01 (per past year) ----------
     profiles_3, title_stub_3 = build_profiles_next_month(series, int(years_back))
     fig3 = go.Figure()
     title3 = f"Seasonality Graph over {int(years_back)} past years: {title_stub_3}"
+
     tm = date.today().month
     ty = date.today().year
     if tm == 12:
@@ -331,12 +499,25 @@ def update_graphs(countries_sel, maturities_sel, years_back):
             max_x3 = max(max_x3, int(np.nanmax(seg.index.values)))
     tickvals_3 = list(range(0, max_x3 + 1, 5))
     ticktext_3 = [(start_calendar_3 + pd.Timedelta(days=int(d))).strftime("%d/%m") for d in tickvals_3]
-    fig3.update_layout(yaxis_title="Yield combination (bps)", xaxis=dict(tickmode="array", tickvals=tickvals_3, ticktext=ticktext_3, tickangle=180), template="plotly_white", margin=dict(l=40, r=20, t=40, b=80))
-    return "", title1, fig1, title2, fig2, title3, fig3
+    fig3.update_layout(
+        xaxis_title="",
+        yaxis_title="Yield combination (bps)",
+        legend_title="Year",
+        template="plotly_white",
+        xaxis=dict(tickmode="array", tickvals=tickvals_3, ticktext=ticktext_3, tickangle=180),
+        margin=dict(l=40, r=20, t=40, b=80),
+    )
+
+    # current-month label under controls
+    month_name_long = datetime(date.today().year, month_idx, 1).strftime("%B")
+    return "", f"Current month: {month_name_long}", label, title1, fig1, title2, fig2, title3, fig3
+
 
 if __name__ == "__main__":
+    # Run and share on LAN; open local browser automatically
     import webbrowser
     import socket
+
     def get_local_ip():
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
@@ -347,15 +528,20 @@ if __name__ == "__main__":
         finally:
             s.close()
         return ip
+
     host = "0.0.0.0"
     port = 8050
     local_ip = get_local_ip()
+
+    # ASCII-safe prints (pas de guillemets mal fermés ni de multi-lignes foireux)
     print("\n================= SHARE THIS =================")
-    print("Local (you) : http://localhost:{port}".format(port=port))
-    print("LAN (team)  : http://{ip}:{port}".format(ip=local_ip, port=port))
-    print("==============================================\n")
+    print(f"Local (toi)    : http://localhost:{port}")
+    print(f"Réseau (équipe): http://{local_ip}:{port}")
+    print("================================================\n")
+
     try:
-        webbrowser.open("http://localhost:{port}".format(port=port))
+        webbrowser.open(f"http://localhost:{port}")
     except Exception:
         pass
+
     app.run_server(host=host, port=port, debug=False)
