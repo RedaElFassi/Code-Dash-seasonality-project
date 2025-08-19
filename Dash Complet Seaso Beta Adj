@@ -1,0 +1,868 @@
+import dash
+from dash import Dash, dcc, html, Input, Output, State, callback, dash_table
+import plotly.graph_objs as go
+import pandas as pd
+import numpy as np
+from datetime import date, datetime, timedelta
+from calendar import monthrange
+from typing import Dict, List, Tuple, Optional
+
+"""
+Yield Seasonality Dashboard — weighted combos + exclusions + heatmap + beta-hedged graphs
+Assumes a single DataFrame `data` with columns like "France 2Y", "Germany 10Y", ...
+Index: DatetimeIndex; values: yields in % (we convert to bps for plotting).
+"""
+
+# -----------------------------
+# Universe
+# -----------------------------
+DEFAULT_COUNTRIES = [
+    "Germany", "France", "Italy", "Spain", "Portugal", "Greece", "Finland", "Belgium"
+]
+DEFAULT_MATURITIES = [2, 5, 7, 10, 15, 20, 25, 30]
+
+# -----------------------------
+# Resolve `data`
+# -----------------------------
+try:
+    data  # type: ignore[name-defined]
+except Exception:
+    try:
+        from data_loader import data  # type: ignore
+    except Exception:
+        data = None
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def m_bucket(m: int) -> str:
+    return f"{int(m)}Y"
+
+def ensure_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df = df.copy()
+        df.index = pd.to_datetime(df.index)
+    return df.sort_index()
+
+def get_series(country: str, maturity: int, data_df: pd.DataFrame) -> pd.Series:
+    col = f"{country} {m_bucket(maturity)}"
+    df = ensure_datetime_index(data_df)
+    if col not in df.columns:
+        raise KeyError(f"Column '{col}' not found in `data`.")
+    return df[col].astype(float).dropna().rename(col)
+
+def align_on_index(series_list: List[pd.Series]) -> pd.DataFrame:
+    df = pd.concat(series_list, axis=1, join="inner").dropna(how="any")
+    df.index = pd.to_datetime(df.index)
+    return df.sort_index()
+
+def first_on_or_after(idx: pd.DatetimeIndex, dt: pd.Timestamp) -> Optional[pd.Timestamp]:
+    pos = idx.searchsorted(dt)
+    if pos < len(idx):
+        return idx[pos]
+    return None
+
+def last_before(idx: pd.DatetimeIndex, dt: pd.Timestamp) -> Optional[pd.Timestamp]:
+    pos = idx.searchsorted(dt)
+    if pos == 0:
+        return None
+    return idx[pos-1]
+
+def month_window_for_year(year: int, month: int) -> Tuple[pd.Timestamp, pd.Timestamp]:
+    start = pd.Timestamp(year=year, month=month, day=1)
+    end = pd.Timestamp(year=year+1, month=1, day=1) if month == 12 else pd.Timestamp(year=year, month=month+1, day=1)
+    return start, end
+
+def slice_window_segment(s: pd.Series, start_cal: datetime, end_cal: datetime, center_to_zero: bool = True) -> pd.Series:
+    idx = s.index
+    a = first_on_or_after(idx, pd.Timestamp(start_cal))
+    b = last_before(idx, pd.Timestamp(end_cal))
+    if a is None or b is None or a > b:
+        return pd.Series(dtype=float)
+    seg = s.loc[a:b].copy()
+    if center_to_zero and len(seg):
+        seg = seg - float(seg.iloc[0])
+    return pd.Series(seg.values, index=(seg.index - pd.Timestamp(start_cal)).days)
+
+def slice_month_segment(s: pd.Series, year: int, month: int) -> pd.Series:
+    start_month, end_month = month_window_for_year(year, month)
+    return slice_window_segment(s, start_month.to_pydatetime(), end_month.to_pydatetime(), center_to_zero=True)
+
+def build_intramonth_profiles(s: pd.Series, month: int, years_back: int) -> Dict[int, pd.Series]:
+    if s.empty:
+        return {}
+    current_year = date.today().year
+    years = list(range(current_year - 1, current_year - years_back - 1, -1))
+    profiles: Dict[int, pd.Series] = {}
+    for y in sorted(years):
+        seg = slice_month_segment(s, y, month)
+        if not seg.empty:
+            profiles[y] = seg
+    return profiles
+
+def safe_ymd(y: int, m: int, d: int) -> datetime:
+    last_d = monthrange(y, m)[1]
+    return datetime(y, m, min(d, last_d))
+
+def build_profiles_anchor_day_next_month(s: pd.Series, years_back: int) -> Tuple[Dict[int, pd.Series], str]:
+    today_dt = date.today()
+    day = today_dt.day
+    month = today_dt.month
+    year = today_dt.year
+
+    title_start = datetime(year, month, min(day, monthrange(year, month)[1])).strftime("%d-%b")
+    if month == 12:
+        title_end = datetime(year + 1, 1, min(day, monthrange(year + 1, 1)[1])).strftime("%d-%b")
+    else:
+        title_end = datetime(year, month + 1, min(day, monthrange(year, month + 1)[1])).strftime("%d-%b")
+
+    profiles: Dict[int, pd.Series] = {}
+    for y in range(year - years_back, year):
+        start_cal = safe_ymd(y, month, day)
+        end_cal = safe_ymd(y + (1 if month == 12 else 0), 1 if month == 12 else month + 1, day)
+        seg = slice_window_segment(s, start_cal, end_cal, center_to_zero=True)
+        if not seg.empty:
+            profiles[y] = seg
+    return profiles, f"{title_start} to {title_end}"
+
+def build_profiles_next_month(s: pd.Series, years_back: int) -> Tuple[Dict[int, pd.Series], str]:
+    today = date.today()
+    month = today.month
+    year = today.year
+
+    if month == 12:
+        start_title = datetime(year + 1, 1, 1)
+        end_title = datetime(year + 1, 2, 1)
+    elif month == 11:
+        start_title = datetime(year, 12, 1)
+        end_title = datetime(year + 1, 1, 1)
+    else:
+        start_title = datetime(year, month + 1, 1)
+        end_title = datetime(year, month + 2, 1)
+
+    profiles: Dict[int, pd.Series] = {}
+    for y in range(year - years_back, year):
+        if month == 12:
+            start_cal = datetime(y + 1, 1, 1)
+            end_cal = datetime(y + 1, 2, 1)
+        elif month == 11:
+            start_cal = datetime(y, 12, 1)
+            end_cal = datetime(y + 1, 1, 1)
+        else:
+            start_cal = datetime(y, month + 1, 1)
+            end_cal = datetime(y, month + 2, 1)
+        seg = slice_window_segment(s, start_cal, end_cal, center_to_zero=True)
+        if not seg.empty:
+            profiles[y] = seg
+
+    return profiles, f"{start_title.strftime('%d-%b')} to {end_title.strftime('%d-%b')}"
+
+def build_average_profile(profiles: Dict[int, pd.Series]) -> Optional[pd.Series]:
+    if not profiles:
+        return None
+    df = pd.concat(list(profiles.values()), axis=1)
+    df.columns = list(profiles.keys())
+    avg = df.mean(axis=1, skipna=True)
+    if 0 in avg.index:
+        avg.loc[0] = 0.0
+    return avg.sort_index()
+
+# -----------------------------
+# Weighted combination logic (new UI: 3 dropdowns + weights)
+# -----------------------------
+def compute_weighted_series(
+    c1: Optional[str], c2: Optional[str], c3: Optional[str],
+    maturities: List[int],
+    weights_two_mats: Tuple[float, float],     # (W_long, W_short) when 2 mats and 2 countries
+    weights_three_mats: Tuple[float, float, float],  # (W_long, W_mid, W_short) when 3 mats and 2 countries
+    weights_three_countries: Tuple[float, float, float],  # (W1, W2, W3) when 3 countries and 1 mat
+    data_df: pd.DataFrame
+) -> Tuple[pd.Series, str]:
+    """
+    - 1 country:
+        1 mat -> outright
+        2 mats -> long - short
+        3 mats -> 2*mid - long - short
+      (weights fixed)
+    - 2 countries: base = Country 1 (C1). Counterparty = first of (C2, C3) that is set.
+        1 mat -> C1 - Cx
+        2 mats -> W_long*(C1 L - Cx L) - W_short*(C1 S - Cx S)
+        3 mats -> (W_mid*2)*(C1 M - Cx M) - W_long*(C1 L - Cx L) - W_short*(C1 S - Cx S)
+          Defaults: W_long=1, W_mid=2, W_short=1
+    - 3 countries + 1 mat -> W2*C2 - W1*C1 - W3*C3
+    """
+    sel_countries = [c for c in [c1, c2, c3] if c]
+    nC = len(sel_countries)
+    nM = len(maturities)
+    if nC == 0 or nM == 0:
+        raise ValueError("Select at least one country and one maturity.")
+    maturities = sorted(maturities)
+    mS = maturities[0]
+    mM = maturities[1] if nM >= 2 else None
+    mL = maturities[2] if nM >= 3 else (maturities[1] if nM == 2 else None)
+
+    # Single country
+    if nC == 1:
+        c = sel_countries[0]
+        if nM == 1:
+            s = get_series(c, mS, data_df)
+            return s, f"{c} {m_bucket(mS)} (outright)"
+        if nM == 2:
+            s_short = get_series(c, mS, data_df)
+            s_long  = get_series(c, mL, data_df)
+            df = align_on_index([s_long, s_short])
+            out = (df.iloc[:,0] - df.iloc[:,1]).rename(f"{c} {m_bucket(mL)} - {m_bucket(mS)}")
+            return out, out.name
+        if nM == 3:
+            s_short = get_series(c, mS, data_df)
+            s_mid   = get_series(c, mM, data_df)  # type: ignore[arg-type]
+            s_long  = get_series(c, mL, data_df)  # type: ignore[arg-type]
+            df = align_on_index([s_mid, s_long, s_short])
+            out = (2*df.iloc[:,0] - df.iloc[:,1] - df.iloc[:,2]).rename(
+                f"2*{c} {m_bucket(mM)} - {c} {m_bucket(mL)} - {c} {m_bucket(mS)}"  # type: ignore[arg-type]
+            )
+            return out, out.name
+        raise ValueError("With 1 country, select 1–3 maturities.")
+
+    # Two countries: base = C1, other = whichever among C2/C3 is set.
+    if nC == 2:
+        if not c1:
+            raise ValueError("Country 1 must be set to define the base.")
+        other = c2 if c2 else c3
+        assert other is not None
+        C1, Cx = c1, other
+        if nM == 1:
+            s1 = get_series(C1, mS, data_df)
+            s2 = get_series(Cx, mS, data_df)
+            df = align_on_index([s1, s2])
+            out = (df.iloc[:,0] - df.iloc[:,1]).rename(f"{C1} - {Cx} {m_bucket(mS)}")
+            return out, out.name
+        if nM == 2:
+            W_long, W_short = weights_two_mats
+            s1L, s2L = get_series(C1, mL, data_df), get_series(Cx, mL, data_df)  # type: ignore[arg-type]
+            s1S, s2S = get_series(C1, mS, data_df), get_series(Cx, mS, data_df)
+            df = align_on_index([s1L, s2L, s1S, s2S])
+            long_spread  = df.iloc[:,0] - df.iloc[:,1]
+            short_spread = df.iloc[:,2] - df.iloc[:,3]
+            out = (W_long*long_spread - W_short*short_spread).rename(
+                f"{W_long}*({C1} {m_bucket(mL)} - {Cx} {m_bucket(mL)}) - {W_short}*({C1} {m_bucket(mS)} - {Cx} {m_bucket(mS)})"
+            )
+            return out, out.name
+        if nM == 3:
+            W_long, W_mid, W_short = weights_three_mats
+            s1L, s2L = get_series(C1, mL, data_df), get_series(Cx, mL, data_df)  # type: ignore[arg-type]
+            s1M, s2M = get_series(C1, mM, data_df), get_series(Cx, mM, data_df)  # type: ignore[arg-type]
+            s1S, s2S = get_series(C1, mS, data_df), get_series(Cx, mS, data_df)
+            df = align_on_index([s1M, s2M, s1L, s2L, s1S, s2S])
+            mid_spread   = df.iloc[:,0] - df.iloc[:,1]
+            long_spread  = df.iloc[:,2] - df.iloc[:,3]
+            short_spread = df.iloc[:,4] - df.iloc[:,5]
+            out = ( (2*W_mid)*mid_spread - W_long*long_spread - W_short*short_spread ).rename(
+                f"{2*W_mid}*({C1} {m_bucket(mM)} - {Cx} {m_bucket(mM)}) - {W_long}*({C1} {m_bucket(mL)} - {Cx} {m_bucket(mL)}) - {W_short}*({C1} {m_bucket(mS)} - {Cx} {m_bucket(mS)})"
+            )
+            return out, out.name
+        raise ValueError("With 2 countries, select 1–3 maturities.")
+
+    # Three countries: require 1 maturity -> W2*C2 - W1*C1 - W3*C3
+    if nC == 3:
+        if len(maturities) != 1:
+            raise ValueError("With 3 countries, select exactly 1 maturity.")
+        W1, W2, W3 = weights_three_countries
+        s1 = get_series(c1, mS, data_df) if c1 else None
+        s2 = get_series(c2, mS, data_df) if c2 else None
+        s3 = get_series(c3, mS, data_df) if c3 else None
+        series_list = [x for x in [s1, s2, s3] if x is not None]
+        df = align_on_index(series_list)  # type: ignore[arg-type]
+        # Map columns to C1,C2,C3 order
+        cols_map = {}
+        if c1: cols_map['C1'] = df.filter(like=c1).columns[0]
+        if c2: cols_map['C2'] = df.filter(like=c2).columns[0]
+        if c3: cols_map['C3'] = df.filter(like=c3).columns[0]
+        out = ( (W2*df[cols_map['C2']]) - (W1*df[cols_map['C1']]) - (W3*df[cols_map['C3']]) ).rename(
+            f"{W2}*{c2} {m_bucket(mS)} - {W1}*{c1} {m_bucket(mS)} - {W3}*{c3} {m_bucket(mS)}"
+        )
+        return out, out.name
+
+    raise ValueError("Invalid selection state.")
+
+# -----------------------------
+# Heatmap monthly deltas
+# -----------------------------
+MONTH_NAMES = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+
+def month_delta(series: pd.Series, year: int, month: int) -> Optional[float]:
+    """Return end_of_month - start_of_month (bps) for given year-month; None if insufficient data."""
+    if series.empty:
+        return None
+    start, end = month_window_for_year(year, month)
+    a = first_on_or_after(series.index, start)
+    b = last_before(series.index, end)
+    if a is None or b is None or a > b:
+        return None
+    s = float(series.loc[a])
+    e = float(series.loc[b])
+    return e - s
+
+def build_heatmap_matrix(series: pd.Series, years: List[int]) -> Tuple[pd.DataFrame, List[str], List[str]]:
+    """Rows = years (desc) + 'Average', Cols = months Jan..Dec, values = monthly deltas (bps)."""
+    vals = []
+    for y in sorted(years, reverse=True):
+        row = []
+        for m in range(1,13):
+            d = month_delta(series, y, m)
+            row.append(np.nan if d is None else d)
+        vals.append(row)
+    df = pd.DataFrame(vals, index=[str(y) for y in sorted(years, reverse=True)], columns=MONTH_NAMES)
+    avg = df.mean(axis=0, skipna=True)
+    df.loc["Average"] = avg
+    return df, list(df.index), list(df.columns)
+
+def heatmap_figure(df: pd.DataFrame) -> go.Figure:
+    z = df.values.astype(float)
+    fig = go.Figure(data=go.Heatmap(
+        z=z,
+        x=list(df.columns),
+        y=list(df.index),
+        colorscale=[
+            [0.0, "rgb(165,0,38)"],   # dark red
+            [0.5, "rgb(255,255,191)"],# cream
+            [1.0, "rgb(0,104,55)"],   # dark green
+        ],
+        colorbar=dict(title="Δ (bps)"),
+        zmid=0
+    ))
+    fig.update_layout(
+        template="plotly_white",
+        margin=dict(l=60, r=20, t=30, b=40),
+    )
+    return fig
+
+# -----------------------------
+# Regression / beta-hedged helpers (only for box: 2 countries & 2 maturities)
+# -----------------------------
+def regression_beta(y: pd.Series, x: pd.Series) -> Optional[float]:
+    """Simple OLS slope using overlapping dates. Returns None if not enough points."""
+    df = align_on_index([y, x])
+    if len(df) < 5:
+        return None
+    # slope from polyfit
+    slope, _ = np.polyfit(df.iloc[:,1].values, df.iloc[:,0].values, 1)
+    return float(slope)
+
+def build_box_and_long_spread(
+    c1: str, cx: str, m_short: int, m_long: int, data_df: pd.DataFrame
+) -> Tuple[pd.Series, pd.Series]:
+    """box = (C1 L - Cx L) - (C1 S - Cx S); driver = (C1 L - Cx L)."""
+    s1L, s2L = get_series(c1, m_long, data_df), get_series(cx, m_long, data_df)
+    s1S, s2S = get_series(c1, m_short, data_df), get_series(cx, m_short, data_df)
+    df = align_on_index([s1L, s2L, s1S, s2S])
+    long_spread = df.iloc[:,0] - df.iloc[:,1]
+    box = long_spread - (df.iloc[:,2] - df.iloc[:,3])
+    return (box * 100.0).rename("box_bps"), (long_spread * 100.0).rename("long_spread_bps")  # in bps
+
+def window_start_for_graph1(y: int) -> datetime:
+    m = date.today().month
+    return datetime(y, m, 1)
+
+def window_start_for_graph2(y: int) -> datetime:
+    today_dt = date.today()
+    return safe_ymd(y, today_dt.month, today_dt.day)
+
+def window_start_for_graph3(y: int) -> datetime:
+    t = date.today()
+    if t.month == 12:
+        return datetime(y + 1, 1, 1)
+    else:
+        return datetime(y, t.month + 1, 1)
+
+def window_end_one_month_after(start_dt: datetime) -> datetime:
+    y, m = start_dt.year, start_dt.month
+    if m == 12:
+        return datetime(y + 1, 1, 1)
+    else:
+        return datetime(y, m + 1, 1)
+
+def regression_lookback_delta(choice: str) -> timedelta:
+    if choice == "3M":
+        return timedelta(days=365//4 * 3)  # ~273? keep simple 90*3=270; but we’ll use 90*3
+    if choice == "6M":
+        return timedelta(days=182)  # approx
+    return timedelta(days=365)
+
+def regression_lookback_exact(choice: str) -> timedelta:
+    if choice == "3M":
+        return timedelta(days=90)
+    if choice == "6M":
+        return timedelta(days=182)
+    return timedelta(days=365)
+
+def slice_and_center(series: pd.Series, start_dt: datetime, end_dt: datetime) -> pd.Series:
+    seg = slice_window_segment(series, start_dt, end_dt, center_to_zero=True)
+    return seg
+
+def build_beta_profiles_per_graph(
+    c1: str, cx: str, mS: int, mL: int, years: List[int], lookback_choice: str, data_df: pd.DataFrame, beta_override: Optional[float]
+) -> Tuple[Dict[int, pd.Series], Dict[int, float], Dict[int, pd.Series]]:
+    """
+    Returns:
+      profiles_1, betas_1, avg_1   for Graph 1 window,
+      (but we call this function per graph separately in the main callback to keep code clear)
+    """
+    raise NotImplementedError  # not used; we compute inline per graph below
+
+# -----------------------------
+# App layout
+# -----------------------------
+app: Dash = dash.Dash(__name__)
+app.title = "Seasonality Project"
+
+app.layout = html.Div([
+    html.H2("📈 Yield Seasonality Dashboard (Dash)"),
+    html.Hr(),
+
+    # Data warning
+    html.Div(id="data-warning", style={"color": "crimson", "marginBottom": "10px"}),
+
+    # Top selectors
+    html.Div([
+        html.Div([
+            html.Label("Country 1 (base)"),
+            dcc.Dropdown(id="country1", options=[{"label": c, "value": c} for c in DEFAULT_COUNTRIES],
+                         value="France", clearable=True),
+            html.Br(),
+            html.Label("Country 2"),
+            dcc.Dropdown(id="country2", options=[{"label": c, "value": c} for c in DEFAULT_COUNTRIES],
+                         value="Germany", clearable=True),
+            html.Br(),
+            html.Label("Country 3"),
+            dcc.Dropdown(id="country3", options=[{"label": c, "value": c} for c in DEFAULT_COUNTRIES],
+                         value=None, clearable=True),
+        ], style={"width": "26%", "display": "inline-block", "verticalAlign": "top"}),
+
+        html.Div([
+            html.Label("Maturities (1–3)"),
+            dcc.Checklist(
+                id="maturities",
+                options=[{"label": str(m), "value": m} for m in DEFAULT_MATURITIES],
+                value=[10],
+                inline=False,
+                inputStyle={"marginRight": "6px"},
+                labelStyle={"display": "inline-block"},
+            ),
+            html.Br(),
+            html.Label("Lookback years (N)"),
+            dcc.Slider(id="years-back", min=1, max=10, step=1, value=10,
+                       marks={i: str(i) for i in range(1, 11)}),
+            html.Div(id="current-month", style={"marginTop": "10px"}),
+            html.Div(id="hide-years-container"),
+        ], style={"width": "40%", "display": "inline-block", "marginLeft": "2%", "verticalAlign": "top"}),
+
+        html.Div([
+            html.Label("Weights (contextual)"),
+            html.Div([
+                html.Div([html.Label("2 mats (box): W long"), dcc.Input(id="w_long", type="number", value=1.0, step=0.1, min=0)]),
+                html.Div([html.Label("2 mats (box): W short"), dcc.Input(id="w_short", type="number", value=1.0, step=0.1, min=0)]),
+            ], style={"display":"grid","gridTemplateColumns":"1fr 1fr","gap":"8px"}),
+            html.Br(),
+            html.Div([
+                html.Div([html.Label("3 mats (fly): W long"), dcc.Input(id="w3_long", type="number", value=1.0, step=0.1, min=0)]),
+                html.Div([html.Label("3 mats (fly): W mid"),  dcc.Input(id="w3_mid",  type="number", value=2.0, step=0.1, min=0)]),
+                html.Div([html.Label("3 mats (fly): W short"),dcc.Input(id="w3_short",type="number", value=1.0, step=0.1, min=0)]),
+            ], style={"display":"grid","gridTemplateColumns":"1fr 1fr 1fr","gap":"8px"}),
+            html.Br(),
+            html.Div([
+                html.Div([html.Label("3 countries: W C1"), dcc.Input(id="wc1", type="number", value=1.0, step=0.1, min=0)]),
+                html.Div([html.Label("3 countries: W C2"), dcc.Input(id="wc2", type="number", value=2.0, step=0.1, min=0)]),
+                html.Div([html.Label("3 countries: W C3"), dcc.Input(id="wc3", type="number", value=1.0, step=0.1, min=0)]),
+            ], style={"display":"grid","gridTemplateColumns":"1fr 1fr 1fr","gap":"8px"}),
+        ], style={"width": "30%", "display": "inline-block", "marginLeft": "2%", "verticalAlign": "top"}),
+    ]),
+
+    html.Hr(),
+    html.H4("Constructed series"),
+    html.Div(id="series-label", style={"fontStyle": "italic", "marginBottom": "10px"}),
+
+    # Graph 1
+    html.H4(id="title_g1"),
+    dcc.Graph(id="g1", config={"displaylogo": False}),
+
+    # Graph 2
+    html.H4(id="title_g2"),
+    dcc.Graph(id="g2", config={"displaylogo": False}),
+
+    # Graph 3
+    html.H4(id="title_g3"),
+    dcc.Graph(id="g3", config={"displaylogo": False}),
+
+    html.Hr(),
+
+    # Heatmap
+    html.H4("Monthly Δ heatmap (end-of-month − start-of-month, bps)"),
+    dcc.Graph(id="heatmap", config={"displaylogo": False}),
+
+    html.Hr(),
+
+    # Beta-hedged controls
+    html.Div([
+        html.H4("Beta-hedged versions (only if 2 countries & 2 maturities)"),
+        html.Div([
+            html.Label("Regression window"),
+            dcc.RadioItems(
+                id="reg_window",
+                options=[{"label":"3M","value":"3M"},{"label":"6M","value":"6M"},{"label":"1Y","value":"1Y"}],
+                value="6M",
+                inline=True
+            ),
+            html.Span("  |  "),
+            html.Label("Beta override (use this value for all years & graphs)"),
+            dcc.Input(id="beta_override", type="number", value=None, step=0.01),
+            html.Button("Reset", id="beta_reset", n_clicks=0, style={"marginLeft":"8px"}),
+        ], style={"marginBottom":"10px"}),
+    ]),
+
+    # Hedged graphs
+    html.H4(id="title_h1"),
+    dcc.Graph(id="h1", config={"displaylogo": False}),
+    html.Div(id="beta_table_1"),
+
+    html.H4(id="title_h2"),
+    dcc.Graph(id="h2", config={"displaylogo": False}),
+    html.Div(id="beta_table_2"),
+
+    html.H4(id="title_h3"),
+    dcc.Graph(id="h3", config={"displaylogo": False}),
+    html.Div(id="beta_table_3"),
+
+    # Store for beta override reset state (simple toggler)
+    dcc.Store(id="beta_override_effective"),
+])
+
+# -----------------------------
+# Dynamic "hide years" checklist (depends on slider)
+# -----------------------------
+@callback(
+    Output("hide-years-container", "children"),
+    Input("years-back", "value"),
+)
+def render_hide_years(N):
+    cur = date.today().year
+    years = list(range(cur-1, cur-N-1, -1))
+    return html.Div([
+        html.Label("Hide years (exclude from plots)"),
+        dcc.Checklist(
+            id="hide-years",
+            options=[{"label": str(y), "value": y} for y in years],
+            value=[],
+            inline=True,
+            inputStyle={"marginRight":"6px"},
+            labelStyle={"marginRight":"12px"}
+        )
+    ])
+
+# Reset beta override
+@callback(
+    Output("beta_override_effective", "data"),
+    Input("beta_reset", "n_clicks"),
+    State("beta_override", "value"),
+    prevent_initial_call=False
+)
+def reset_beta(n_clicks, user_beta):
+    # If clicked, clear override; else pass through current value
+    # We always return {'value': ...} to keep a consistent structure.
+    ctx = dash.callback_context
+    if ctx.triggered and "beta_reset" in ctx.triggered[0]["prop_id"]:
+        return {"value": None}
+    return {"value": user_beta}
+
+# -----------------------------
+# Main callback
+# -----------------------------
+@callback(
+    Output("data-warning", "children"),
+    Output("current-month", "children"),
+    Output("series-label", "children"),
+    Output("title_g1", "children"), Output("g1", "figure"),
+    Output("title_g2", "children"), Output("g2", "figure"),
+    Output("title_g3", "children"), Output("g3", "figure"),
+    Output("heatmap", "figure"),
+    Output("title_h1", "children"), Output("h1", "figure"), Output("beta_table_1", "children"),
+    Output("title_h2", "children"), Output("h2", "figure"), Output("beta_table_2", "children"),
+    Output("title_h3", "children"), Output("h3", "figure"), Output("beta_table_3", "children"),
+    Input("country1", "value"), Input("country2", "value"), Input("country3", "value"),
+    Input("maturities", "value"),
+    Input("w_long", "value"), Input("w_short", "value"),
+    Input("w3_long", "value"), Input("w3_mid", "value"), Input("w3_short", "value"),
+    Input("wc1", "value"), Input("wc2", "value"), Input("wc3", "value"),
+    Input("years-back", "value"),
+    Input("hide-years", "value"),
+    Input("reg_window", "value"),
+    Input("beta_override_effective", "data"),
+)
+def update_all(c1, c2, c3, maturities_sel,
+               w_long, w_short, w3_long, w3_mid, w3_short, wc1, wc2, wc3,
+               years_back, hide_years, reg_window, beta_override_store):
+    # Data
+    if data is None:
+        empty = go.Figure()
+        return ("No `data` DataFrame found. Provide it via `data_loader.py` or in the global scope.",
+                "", "", "", empty, "", empty, "", empty, empty,
+                "", empty, html.Div(),
+                "", empty, html.Div(),
+                "", empty, html.Div())
+
+    # Validate selections minimally
+    mats = sorted(list(map(int, (maturities_sel or []))))
+    if len([x for x in [c1, c2, c3] if x]) == 0 or len(mats) == 0:
+        empty = go.Figure()
+        return ("", "", "Select at least one country and one maturity.",
+                "", empty, "", empty, "", empty, empty,
+                "", empty, html.Div(),
+                "", empty, html.Div(),
+                "", empty, html.Div())
+
+    # Compute weighted series (in bps)
+    try:
+        series, label = compute_weighted_series(
+            c1, c2, c3, mats,
+            (float(w_long or 1.0), float(w_short or 1.0)),
+            (float(w3_long or 1.0), float(w3_mid or 2.0), float(w3_short or 1.0)),
+            (float(wc1 or 1.0), float(wc2 or 2.0), float(wc3 or 1.0)),
+            data
+        )
+    except Exception as e:
+        empty = go.Figure()
+        return (f"Error computing series: {e}", "", "", "", empty, "", empty, "", empty, empty,
+                "", empty, html.Div(),
+                "", empty, html.Div(),
+                "", empty, html.Div())
+
+    series = (series * 100.0).dropna() if series.abs().max() < 50 else series.dropna()
+    # Note: if already bps, keep as is.
+
+    # Years universe
+    curY = date.today().year
+    years_all = list(range(curY-1, curY-int(years_back)-1, -1))
+    hidden = set(hide_years or [])
+    years_used = [y for y in sorted(years_all) if y not in hidden]
+
+    # ---------- Graph 1 (01-M -> 01-M+1)
+    m_idx = date.today().month
+    month_name_short = datetime(curY, m_idx, 1).strftime("%b")
+    next_month_short = datetime(2000, m_idx % 12 + 1, 1).strftime("%b")
+    profiles_1_all = build_intramonth_profiles(series, m_idx, int(years_back))
+    profiles_1 = {y:seg for y,seg in profiles_1_all.items() if y in years_used}
+
+    title_g1 = f"Seasonality Graph over {len(years_used)} past years: 01-{month_name_short} to 01-{next_month_short}"
+    fig1 = go.Figure()
+    max_x1 = 0
+    for y in sorted(profiles_1.keys()):
+        seg = profiles_1[y]
+        fig1.add_trace(go.Scatter(x=seg.index.values, y=seg.values, mode="lines", name=str(y)))
+        if len(seg.index): max_x1 = max(max_x1, int(np.nanmax(seg.index.values)))
+    avg1 = build_average_profile(profiles_1)
+    if avg1 is not None and len(avg1) > 0:
+        fig1.add_trace(go.Scatter(x=avg1.index.values, y=avg1.values, mode="lines", name="Average",
+                                  line=dict(width=3, color="black")))
+        max_x1 = max(max_x1, int(avg1.index.max()))
+    start_calendar_1 = pd.Timestamp(year=curY, month=m_idx, day=1)
+    tickvals_1 = list(range(0, max_x1 + 1, 5))
+    ticktext_1 = [(start_calendar_1 + pd.Timedelta(days=int(d))).strftime("%d/%m") for d in tickvals_1]
+    fig1.update_layout(template="plotly_white", xaxis=dict(tickmode="array", tickvals=tickvals_1, ticktext=ticktext_1, tickangle=180),
+                       yaxis_title="bps", legend_title="Year", margin=dict(l=40,r=20,t=40,b=80))
+
+    # ---------- Graph 2 (today d -> d+1M per past year)
+    profiles_2_all, stub_2 = build_profiles_anchor_day_next_month(series, int(years_back))
+    profiles_2 = {y:seg for y,seg in profiles_2_all.items() if y in years_used}
+    title_g2 = f"Seasonality Graph over {len(years_used)} past years: {stub_2}"
+    fig2 = go.Figure()
+    max_x2 = 0
+    start_calendar_2 = pd.Timestamp(year=curY, month=date.today().month,
+                                    day=min(date.today().day, monthrange(curY, date.today().month)[1]))
+    for y, seg in sorted(profiles_2.items()):
+        fig2.add_trace(go.Scatter(x=seg.index.values, y=seg.values, mode="lines", name=str(y)))
+        if len(seg.index): max_x2 = max(max_x2, int(np.nanmax(seg.index.values)))
+    avg2 = build_average_profile(profiles_2)
+    if avg2 is not None and len(avg2) > 0:
+        fig2.add_trace(go.Scatter(x=avg2.index.values, y=avg2.values, mode="lines", name="Average",
+                                  line=dict(width=3, color="black")))
+        max_x2 = max(max_x2, int(avg2.index.max()))
+    tickvals_2 = list(range(0, max_x2 + 1, 5))
+    ticktext_2 = [(start_calendar_2 + pd.Timedelta(days=int(d))).strftime("%d/%m") for d in tickvals_2]
+    fig2.update_layout(template="plotly_white", xaxis=dict(tickmode="array", tickvals=tickvals_2, ticktext=ticktext_2, tickangle=180),
+                       yaxis_title="bps", legend_title="Year", margin=dict(l=40,r=20,t=40,b=80))
+
+    # ---------- Graph 3 (next month 01 -> 01)
+    profiles_3_all, stub_3 = build_profiles_next_month(series, int(years_back))
+    profiles_3 = {y:seg for y,seg in profiles_3_all.items() if y in years_used}
+    title_g3 = f"Seasonality Graph over {len(years_used)} past years: {stub_3}"
+    fig3 = go.Figure()
+    tm = date.today().month
+    ty = curY
+    start_calendar_3 = pd.Timestamp(year=ty+1, month=1, day=1) if tm==12 else pd.Timestamp(year=ty, month=tm+1, day=1)
+    max_x3 = 0
+    for y, seg in sorted(profiles_3.items()):
+        fig3.add_trace(go.Scatter(x=seg.index.values, y=seg.values, mode="lines", name=str(y)))
+        if len(seg.index): max_x3 = max(max_x3, int(np.nanmax(seg.index.values)))
+    avg3 = build_average_profile(profiles_3)
+    if avg3 is not None and len(avg3) > 0:
+        fig3.add_trace(go.Scatter(x=avg3.index.values, y=avg3.values, mode="lines", name="Average",
+                                  line=dict(width=3, color="black")))
+        max_x3 = max(max_x3, int(avg3.index.max()))
+    tickvals_3 = list(range(0, max_x3 + 1, 5))
+    ticktext_3 = [(start_calendar_3 + pd.Timedelta(days=int(d))).strftime("%d/%m") for d in tickvals_3]
+    fig3.update_layout(template="plotly_white", xaxis=dict(tickmode="array", tickvals=tickvals_3, ticktext=ticktext_3, tickangle=180),
+                       yaxis_title="bps", legend_title="Year", margin=dict(l=40,r=20,t=40,b=80))
+
+    # ---------- Heatmap ----------
+    heat_df, _, _ = build_heatmap_matrix(series, years_used)
+    fig_heat = heatmap_figure(heat_df)
+
+    # ---------- Beta-hedged graphs ----------
+    # Only if it's a "box": 2 countries selected and exactly 2 maturities
+    hedged_titles = ("","", "")
+    figs_h = (go.Figure(), go.Figure(), go.Figure())
+    tables_h = (html.Div(), html.Div(), html.Div())
+
+    c_sel = [c for c in [c1, c2, c3] if c]
+    is_box = (len(c_sel) == 2 and len(mats) == 2 and c1 is not None)
+    eff_beta = beta_override_store.get("value") if isinstance(beta_override_store, dict) else None
+    if is_box:
+        cx = c2 if (c2 and c1 != c2) else c3  # pick the filled counterparty
+        if cx is None:
+            is_box = False
+
+    if is_box:
+        mS, mL = mats[0], mats[1]
+        # Build long_spread and box at % scale then converted to bps inside helper
+        box_bps, long_bps = build_box_and_long_spread(c1, cx, mS, mL, data)
+
+        # Years used (same filter)
+        ylist = years_used
+
+        # Helper to compute per-graph hedged profiles & betas
+        def compute_hedged_profiles(get_start_fn, title_stub: str):
+            profiles = {}
+            betas = {}
+            # choose regression window delta
+            lookback = regression_lookback_exact(reg_window)
+
+            for y in ylist:
+                start_dt = get_start_fn(y)
+                end_dt = window_end_one_month_after(start_dt)
+
+                # Determine regression sample: [start_dt - lookback, start_dt)
+                reg_start = start_dt - lookback
+                # Slice overlapping real series (levels, not centered)
+                y_box = slice_window_segment(box_bps, reg_start, start_dt, center_to_zero=False)
+                x_long = slice_window_segment(long_bps, reg_start, start_dt, center_to_zero=False)
+                # Turn them back to pd.Series indexed by calendar offsets relative to reg_start to align
+                y_box_abs = pd.Series(y_box.values, index=[reg_start + timedelta(days=int(d)) for d in y_box.index])
+                x_long_abs = pd.Series(x_long.values, index=[reg_start + timedelta(days=int(d)) for d in x_long.index])
+
+                # compute beta unless override
+                beta = eff_beta if eff_beta is not None else regression_beta(y_box_abs, x_long_abs)
+                if beta is None:
+                    continue
+                betas[y] = float(beta)
+
+                # Build display segment over [start_dt, end_dt], then hedge & center to 0
+                seg_box = slice_window_segment(box_bps, start_dt, end_dt, center_to_zero=True)
+                seg_long = slice_window_segment(long_bps, start_dt, end_dt, center_to_zero=True)
+                hedged = seg_box - beta * seg_long  # both centered at 0 -> hedged starts at 0 as well
+                if len(hedged) > 0:
+                    profiles[y] = hedged
+
+            # Average
+            avg = build_average_profile(profiles)
+
+            # Make figure
+            fig = go.Figure()
+            max_x = 0
+            for y, seg in sorted(profiles.items()):
+                fig.add_trace(go.Scatter(x=seg.index.values, y=seg.values, mode="lines", name=str(y)))
+                if len(seg.index): max_x = max(max_x, int(np.nanmax(seg.index.values)))
+            if avg is not None and len(avg) > 0:
+                fig.add_trace(go.Scatter(x=avg.index.values, y=avg.values, mode="lines", name="Average",
+                                         line=dict(width=3, color="black")))
+                max_x = max(max_x, int(avg.index.max()))
+
+            # x tick labels
+            start_calendar = pd.Timestamp(get_start_fn(curY))
+            tickvals = list(range(0, max_x + 1, 5))
+            ticktext = [(start_calendar + pd.Timedelta(days=int(d))).strftime("%d/%m") for d in tickvals]
+            fig.update_layout(template="plotly_white",
+                              xaxis=dict(tickmode="array", tickvals=tickvals, ticktext=ticktext, tickangle=180),
+                              yaxis_title="bps (hedged)", legend_title="Year", margin=dict(l=40,r=20,t=40,b=80))
+
+            # Make simple beta table
+            cols = [{"name": str(y), "id": str(y)} for y in ylist]
+            vals = [{str(y): (f"{betas[y]:.3f}" if y in betas else "") for y in ylist}]
+            table = dash_table.DataTable(
+                columns=cols,
+                data=vals,
+                style_table={"overflowX":"auto"},
+                style_cell={"textAlign":"center"},
+                style_header={"fontWeight":"bold"},
+            )
+            return fig, table
+
+        # Build for each hedged graph
+        month_short = datetime(curY, m_idx, 1).strftime("%b")
+        next_short = datetime(2000, m_idx % 12 + 1, 1).strftime("%b")
+        hedged_titles = (
+            f"Hedged — 01-{month_short} to 01-{next_short}",
+            f"Hedged — {stub_2}",
+            f"Hedged — {stub_3}",
+        )
+        fig_h1, tbl1 = compute_hedged_profiles(window_start_for_graph1, hedged_titles[0])
+        fig_h2, tbl2 = compute_hedged_profiles(window_start_for_graph2, hedged_titles[1])
+        fig_h3, tbl3 = compute_hedged_profiles(window_start_for_graph3, hedged_titles[2])
+        figs_h = (fig_h1, fig_h2, fig_h3)
+        tables_h = (tbl1, tbl2, tbl3)
+
+    month_name_long = datetime(curY, m_idx, 1).strftime("%B")
+    return (
+        "", f"Current month: {month_name_long}", label,
+        title_g1, fig1,
+        title_g2, fig2,
+        title_g3, fig3,
+        fig_heat,
+        hedged_titles[0], figs_h[0], tables_h[0],
+        hedged_titles[1], figs_h[1], tables_h[1],
+        hedged_titles[2], figs_h[2], tables_h[2],
+    )
+
+# -----------------------------
+# Run
+# -----------------------------
+if __name__ == "__main__":
+    # Run and share on LAN; open local browser automatically (ASCII-only prints)
+    import webbrowser
+    import socket
+
+    def get_local_ip():
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+        except Exception:
+            ip = "127.0.0.1"
+        finally:
+            s.close()
+        return ip
+
+    host = "0.0.0.0"
+    port = 8050
+    local_ip = get_local_ip()
+
+    print("\n================= SHARE THIS =================")
+    print("Local (you) : http://localhost:{port}".format(port=port))
+    print("LAN (team)  : http://{ip}:{port}".format(ip=local_ip, port=port))
+    print("==============================================\n")
+
+    try:
+        webbrowser.open("http://localhost:{port}".format(port=port))
+    except Exception:
+        pass
+
+    app.run_server(host=host, port=port, debug=False)
