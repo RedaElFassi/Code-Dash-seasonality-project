@@ -1,0 +1,1162 @@
+# -*- coding: utf-8 -*-
+# =========================================================
+# Dash app — Box/Spread/Curve (Levels & Daily) + Backtest
+# =========================================================
+from typing import Dict, Tuple, Optional, List
+
+import numpy as np
+import pandas as pd
+import statsmodels.api as sm
+
+import dash
+from dash import Dash, dcc, html, Input, Output, State
+from dash import dash_table
+import plotly.graph_objs as go
+
+# =========================
+# Try to locate `data`
+# =========================
+try:
+    data  # type: ignore[name-defined]
+except Exception:
+    try:
+        from data_loader import data  # type: ignore
+    except Exception:
+        data = None  # warning in UI
+
+# ======== NEW: try to locate swap dataframes ========
+try:
+    df_ESTR  # type: ignore[name-defined]
+except Exception:
+    try:
+        from data_loader import df_ESTR  # type: ignore
+    except Exception:
+        df_ESTR = None
+
+try:
+    df_SWAP_3M  # type: ignore[name-defined]
+except Exception:
+    try:
+        from data_loader import df_SWAP_3M  # type: ignore
+    except Exception:
+        df_SWAP_3M = None
+
+try:
+    df_SWAP_6M  # type: ignore[name-defined]
+except Exception:
+    try:
+        from data_loader import df_SWAP_6M  # type: ignore
+    except Exception:
+        df_SWAP_6M = None
+# =====================================================
+
+# =========================
+# Config
+# =========================
+AVAILABLE_COUNTRIES = ["France", "Italy", "Spain"]
+# ======== NEW: swap entities considered like countries ========
+SWAP_ENTITIES = ["ESTR", "EURIBOR 3M", "EURIBOR 6M"]
+ENTITIES = AVAILABLE_COUNTRIES + SWAP_ENTITIES
+# =============================================================
+
+BENCHMARK_CURVE_COUNTRY = "Germany"
+# BASELINE_LOW_COUNTRY is no longer a constant; now chosen in UI
+BASELINE_LOW_COUNTRY = "Germany"
+
+AVAILABLE_MATURITIES = ["2Y","3Y","5Y","7Y","10Y","15Y","20Y","25Y","30Y"]
+
+DEFAULT_WINDOW = 126
+WINDOW_OPTIONS = [
+    {"label": "3M (63)", "value": 63},
+    {"label": "6M (126)", "value": 126},
+    {"label": "1Y (252)", "value": 252},
+]
+
+DEFAULT_R2_SCATTER = 0.30
+DEFAULT_R2_BACKTEST = 0.30
+DEFAULT_EPS_THR = 0.5
+DEFAULT_TP_MULT = 0.5
+DEFAULT_SL_MULT = 0.5
+DV01_K = 10.0  # k€
+DEFAULT_COOLDOWN = 10
+
+DEFAULT_LOOKBACK_PLOTS = 10  # années
+DEFAULT_LOOKBACK_BT    = 10  # années
+MAX_LOOKBACK_YEARS     = 25
+
+TENOR_10Y  = "TENOR_10Y"
+TENOR_LONG = "TENOR_LONGLEG"
+
+MODE_BOX  = "BOX"
+MODE_PAIR = "PAIR"   # Box − β·Spread
+
+MONTH_NAMES = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+
+# =========================
+# Helpers
+# =========================
+def _col(country, matu): return f"{country} {matu}"
+def _safe_name(x): return x.replace(" ", "_")
+def _col_bps(country, matu): return f"{_safe_name(country)}_{matu}_bps"
+
+def ensure_dt_index(df: pd.DataFrame) -> pd.DataFrame:
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df = df.copy()
+        df.index = pd.to_datetime(df.index)
+    return df.sort_index()
+
+def slice_by_years(df: pd.DataFrame, years: int) -> pd.DataFrame:
+    if df.empty or years is None or int(years) <= 0:
+        return df.copy()
+    end = df.index.max()
+    start = end - pd.DateOffset(years=int(years))
+    return df.loc[df.index >= start].copy()
+
+def box_label(country_high: str, country_low: str, short_m: str, long_m: str) -> str:
+    return f"{short_m.lower()}s{long_m} {country_high} vs {country_low}"
+
+def spread_tenor_label(mode: str, long_m: str) -> str:
+    return "10Y" if mode == TENOR_10Y else long_m
+
+# ======== NEW: unified entity fetcher (countries or swaps) ========
+def _m_to_txt(m: str) -> str:
+    # input "10Y" stays "10Y"
+    return str(m)
+
+def get_entity_series(entity: str, matu_txt: str) -> pd.Series:
+    """
+    Retourne la série (float, en %) pour une entité (pays OU swap) à une maturité texte ("10Y", ...).
+    - Pays: data["Country {matu_txt}"]
+    - Swaps:
+        ESTR        -> df_ESTR["{matu_txt}"]
+        EURIBOR 3M  -> df_SWAP_3M["{matu_txt}"]
+        EURIBOR 6M  -> df_SWAP_6M["{matu_txt}"]
+    """
+    # Countries from `data`
+    if entity in AVAILABLE_COUNTRIES + [BENCHMARK_CURVE_COUNTRY]:
+        if data is None:
+            raise KeyError("`data` not available.")
+        df = ensure_dt_index(data)
+        col = f"{entity} {matu_txt}"
+        if col not in df.columns:
+            raise KeyError(f"Column '{col}' not found in `data`.")
+        return df[col].astype(float).dropna().rename(col)
+
+    # Swaps
+    if entity == "ESTR":
+        src = df_ESTR
+    elif entity == "EURIBOR 3M":
+        src = df_SWAP_3M
+    elif entity == "EURIBOR 6M":
+        src = df_SWAP_6M
+    else:
+        raise KeyError(f"Unknown entity '{entity}'.")
+
+    if src is None:
+        raise KeyError(f"DataFrame not provided for '{entity}'.")
+    src = ensure_dt_index(src)
+    if matu_txt not in src.columns:
+        raise KeyError(f"Maturity '{matu_txt}' not in dataframe for '{entity}'.")
+    # Rename to align with country style: "{entity} {matu}"
+    return src[matu_txt].astype(float).dropna().rename(f"{entity} {matu_txt}")
+# ================================================================
+
+# =========================
+# Master builder
+# =========================
+def build_master_dataframe(
+    raw_unused: pd.DataFrame,
+    country_high: str,
+    country_low: str,
+    matu_long: str,
+    matu_short: str,
+    window: int,
+    curve_country: str = BENCHMARK_CURVE_COUNTRY,
+    spread_tenor_mode: str = TENOR_LONG,
+) -> pd.DataFrame:
+    """
+    MODIFIÉ: on ne dépend plus du seul `data` avec colonnes '{country} {matu}'.
+    On fabrique les colonnes en agrégeant les séries d'entités (pays OU swaps).
+    Toutes les séries sont converties en bps (×100).
+    """
+    # Récupération des séries (en %) puis conversion bps
+    s_high_long  = get_entity_series(country_high, _m_to_txt(matu_long))  * 100.0
+    s_low_long   = get_entity_series(country_low,  _m_to_txt(matu_long))  * 100.0
+    s_high_short = get_entity_series(country_high, _m_to_txt(matu_short)) * 100.0
+    s_low_short  = get_entity_series(country_low,  _m_to_txt(matu_short)) * 100.0
+
+    # Spread tenor (10Y ou long leg)
+    spread_matu = "10Y" if spread_tenor_mode == TENOR_10Y else matu_long
+    s_high_spread = get_entity_series(country_high, _m_to_txt(spread_matu)) * 100.0
+    s_low_spread  = get_entity_series(country_low,  _m_to_txt(spread_matu)) * 100.0
+
+    # Curve: on garde l’ancienne définition (courbe DE = long - short)
+    s_curve_long  = get_entity_series(curve_country, _m_to_txt(matu_long))  * 100.0
+    s_curve_short = get_entity_series(curve_country, _m_to_txt(matu_short)) * 100.0
+
+    # Aligner tout le monde
+    df = pd.concat(
+        [
+            s_high_long.rename(_col_bps(country_high, matu_long)),
+            s_low_long.rename(_col_bps(country_low,  matu_long)),
+            s_high_short.rename(_col_bps(country_high, matu_short)),
+            s_low_short.rename(_col_bps(country_low,  matu_short)),
+            s_high_spread.rename(f"{_safe_name(country_high)}_{spread_matu}_bps"),
+            s_low_spread.rename(f"{_safe_name(country_low)}_{spread_matu}_bps"),
+            s_curve_long.rename(f"{_safe_name(curve_country)}_{matu_long}_bps"),
+            s_curve_short.rename(f"{_safe_name(curve_country)}_{matu_short}_bps"),
+        ],
+        axis=1, join="inner"
+    ).dropna(how="any")
+    df = ensure_dt_index(df)
+
+    master = pd.DataFrame(index=df.index)
+    # BOX
+    master["BOX_bps"] = (
+        df[_col_bps(country_high, matu_long)] - df[_col_bps(country_low,  matu_long)]
+        - (df[_col_bps(country_high, matu_short)] - df[_col_bps(country_low,  matu_short)])
+    )
+    # SPREAD
+    master["SPREAD_bps"] = (
+        df[f"{_safe_name(country_high)}_{spread_matu}_bps"] - df[f"{_safe_name(country_low)}_{spread_matu}_bps"]
+    )
+    # CURVE (Germany long - short)
+    master["CURVE_bps"] = df[f"{_safe_name(curve_country)}_{matu_long}_bps"] - df[f"{_safe_name(curve_country)}_{matu_short}_bps"]
+
+    # Daily changes
+    master["dBOX_bps"]    = master["BOX_bps"].diff()
+    master["dSPREAD_bps"] = master["SPREAD_bps"].diff()
+    master["dCURVE_bps"]  = master["CURVE_bps"].diff()
+
+    # Rolling OLS
+    def _rolling_ols_write(ycol, xcol, w, prefix):
+        for suff in ["alpha","beta","r2","tstat","resid"]:
+            master[f"{prefix}_{suff}_w{w}"] = np.nan
+        join = pd.concat([master[ycol].rename("y"), master[xcol].rename("x")], axis=1).dropna()
+        if len(join) < w: return
+        yv, xv, idx = join["y"].values, join["x"].values, join.index
+        out = []
+        for end in range(w, len(join)+1):
+            yy = yv[end-w:end]; xx = xv[end-w:end]
+            X = sm.add_constant(xx, has_constant="add")
+            fit = sm.OLS(yy, X).fit()
+            last_y, last_x = yy[-1], xx[-1]
+            yhat_last = fit.params[0] + fit.params[1]*last_x
+            out.append((idx[end-1], float(fit.params[0]), float(fit.params[1]),
+                        float(fit.rsquared), float(fit.tvalues[1]), float(last_y - yhat_last)))
+        rr = pd.DataFrame(out, columns=["Date","alpha","beta","r2","tstat","resid"]).set_index("Date")
+        for c in ["alpha","beta","r2","tstat","resid"]:
+            master.loc[rr.index, f"{prefix}_{c}_w{w}"] = rr[c]
+
+    w = int(window)
+    _rolling_ols_write("BOX_bps",  "SPREAD_bps", w, "lvl_spread")
+    _rolling_ols_write("BOX_bps",  "CURVE_bps",  w, "lvl_curve")
+    _rolling_ols_write("dBOX_bps", "dSPREAD_bps", w, "chg_spread")
+    _rolling_ols_write("dBOX_bps", "dCURVE_bps",  w, "chg_curve")
+    return master
+
+# =========================
+# Backtest
+# =========================
+def _first_cross(delta_series: pd.Series, tp: float, sl: float, side: int):
+    """delta_series = path - entry_level; side=+1(long), -1(short)."""
+    for dt, d in delta_series.items():
+        if side == +1:
+            if d <= -tp: return dt, "TP"
+            if d >=  sl: return dt, "SL"
+        else:
+            if d >=  tp: return dt, "TP"
+            if d <= -sl: return dt, "SL"
+    return delta_series.index[-1], "TIME"
+
+def backtest_from_master(
+    master: pd.DataFrame,
+    window: int,
+    obs_window_days: int,
+    holding_days: int,
+    resid_threshold: float,
+    r2_entry_threshold: float,
+    tp_mult: float,
+    sl_mult: float,
+    dv01_k: float = DV01_K,
+    driver: str = "SPREAD",
+    cooldown_days: int = DEFAULT_COOLDOWN,
+    mode: str = MODE_BOX
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    d = driver.lower()
+    w = int(window)
+    alpha_col = f"lvl_{d}_alpha_w{w}"
+    beta_col  = f"lvl_{d}_beta_w{w}"
+    r2_col    = f"lvl_{d}_r2_w{w}"
+    x_col     = f"{driver.upper()}_bps"
+    y_col     = "BOX_bps"
+
+    for c in [alpha_col, beta_col, r2_col, x_col, y_col]:
+        if c not in master.columns:
+            return pd.DataFrame(), pd.DataFrame()
+
+    idx = master.index
+    valid_mask = master[[alpha_col, beta_col, r2_col]].notna().all(axis=1)
+    rr_dates = idx[valid_mask].sort_values()
+    if len(rr_dates) == 0:
+        return pd.DataFrame(), pd.DataFrame()
+
+    trades = []
+    L = int(obs_window_days)
+    H = int(holding_days)
+    thr = float(resid_threshold)
+    tp_m = float(tp_mult)
+    sl_m = float(sl_mult)
+    dv = float(dv01_k)
+    cooldown_days = max(int(cooldown_days or 0), 0)
+    next_allowed_dt: Optional[pd.Timestamp] = None
+
+    for i in range(0, len(rr_dates) - L):
+        t0 = rr_dates[i]
+        entry_date = rr_dates[i + L]
+        if next_allowed_dt is not None and entry_date < next_allowed_dt:
+            continue
+
+        x_t = master.at[entry_date, x_col]
+        y_t = master.at[entry_date, y_col]
+        if pd.isna(x_t) or pd.isna(y_t):
+            continue
+        a0 = master.at[t0, alpha_col]
+        b0 = master.at[t0, beta_col]
+        r2 = master.at[t0, r2_col]
+        if pd.isna(a0) or pd.isna(b0) or pd.isna(r2):
+            continue
+
+        y_hat = float(a0) + float(b0) * float(x_t)
+        eps = float(y_t) - y_hat
+        if (abs(eps) < thr) or (float(r2) < float(r2_entry_threshold)):
+            continue
+
+        side = +1 if eps > 0 else -1
+        entry_pos = idx.get_loc(entry_date)
+        exit_pos_lim = min(entry_pos + H, len(idx) - 1)
+
+        if mode == MODE_PAIR:
+            combo_series = master[y_col] - float(b0) * master[x_col]
+            entry_level = float(combo_series.loc[entry_date])
+            path = combo_series.iloc[entry_pos+1: exit_pos_lim+1].dropna()
+            delta_series = path - entry_level
+        else:
+            entry_level = float(y_t)
+            path = master.iloc[entry_pos+1: exit_pos_lim+1][y_col].dropna()
+            delta_series = path - entry_level
+
+        if len(delta_series) == 0:
+            exit_date = entry_date
+            exit_level = entry_level
+            reason = "TIME"
+        else:
+            tp = tp_m * thr
+            sl = sl_m * thr
+            exit_date, reason = _first_cross(delta_series, tp, sl, side)
+            exit_level = float(delta_series.loc[exit_date] + entry_level)
+
+        pnl = -side * (exit_level - entry_level) * dv
+        trades.append({
+            "Entry": entry_date,
+            "Exit": exit_date,
+            "Side": "LONG" if side == +1 else "SHORT",
+            "Mode": mode,
+            "EntryLevel": entry_level,
+            "Alpha": float(a0),
+            "Beta":  float(b0),
+            "R2":    float(r2),
+            "ResidualAtEntry": float(eps),
+            "ExitLevel": exit_level,
+            "Reason": reason,
+            "PnL": float(pnl)
+        })
+        if cooldown_days > 0:
+            next_allowed_dt = entry_date + pd.Timedelta(days=cooldown_days)
+
+    trades_df = pd.DataFrame(trades)
+    if trades_df.empty:
+        return trades_df, pd.DataFrame()
+
+    trades_df = trades_df.sort_values(["Entry", "Exit"]).reset_index(drop=True)
+    trades_df["RealizedCumPnL_by_entry"] = trades_df["PnL"].cumsum()
+    order_by_exit = trades_df.sort_values("Exit").index
+    trades_df["RealizedCumPnL_by_exit"] = np.nan
+    trades_df.loc[order_by_exit, "RealizedCumPnL_by_exit"] = (
+        trades_df.loc[order_by_exit, "PnL"].cumsum().values
+    )
+
+    start_all = trades_df["Entry"].min()
+    end_all   = trades_df["Exit"].max()
+    dates = master.loc[(master.index >= start_all) & (master.index <= end_all)].index
+    pnl_tracker = pd.DataFrame(index=dates)
+
+    if mode == MODE_PAIR:
+        base_series = None
+    else:
+        base_series = master["BOX_bps"]
+
+    for i, row in trades_df.iterrows():
+        entry = row["Entry"]; exit_ = row["Exit"]
+        side  = +1 if row["Side"] == "LONG" else -1
+        if mode == MODE_PAIR:
+            b0 = float(row["Beta"])
+            ser_underlier = master["BOX_bps"] - b0 * master["SPREAD_bps"]
+        else:
+            ser_underlier = base_series
+
+        entry_level = float(row["EntryLevel"])
+        path = ser_underlier.loc[(ser_underlier.index > entry) & (ser_underlier.index <= exit_)].dropna()
+        mtm = -side * (path - entry_level) * dv
+
+        ser = pd.Series(0.0, index=dates, dtype=float)
+        if len(mtm) > 0:
+            ser.loc[mtm.index] = mtm.values
+            last_val = float(mtm.iloc[-1])
+        else:
+            last_val = 0.0
+        ser.loc[ser.index > exit_] = last_val
+        pnl_tracker[f"Trade_{i+1:03d}"] = ser
+
+    pnl_tracker = pnl_tracker.fillna(0.0)
+    pnl_tracker["CumPnL"] = pnl_tracker.sum(axis=1)
+    return trades_df, pnl_tracker
+
+# =========================
+# Heatmap & Stats
+# =========================
+def monthly_pnl_heatmap(trades_df: pd.DataFrame, pnl_tracker: pd.DataFrame) -> Tuple[go.Figure, List[int], pd.DataFrame]:
+    """Rows = 'Average' + years (DESC). Cols = months + 'YearTotal'.
+       Cell (y,m) = PnL(k€) of portfolio built from trades ENTERED in month m of year y
+       (end-of-month − start-of-month)."""
+    if trades_df.empty or pnl_tracker.empty:
+        return go.Figure(), [], pd.DataFrame()
+
+    # map trade index -> column name in pnl_tracker
+    col_map = {i+1: f"Trade_{i+1:03d}" for i in range(len(trades_df))}
+    years = sorted(trades_df["Entry"].dt.year.unique().tolist(), reverse=True)
+    months = list(range(1,13))
+    mat = pd.DataFrame(index=[str(y) for y in years], columns=MONTH_NAMES, dtype=float)
+
+    trades_df = trades_df.copy()
+    trades_df["TradeIdx"] = trades_df.index + 1
+
+    for y in years:
+        for m in months:
+            cond = (trades_df["Entry"].dt.year == y) & (trades_df["Entry"].dt.month == m)
+            idxs = trades_df.loc[cond, "TradeIdx"].astype(int).tolist()
+            if len(idxs) == 0:
+                mat.loc[str(y), MONTH_NAMES[m-1]] = 0.0
+                continue
+            cols = [col_map[i] for i in idxs if col_map[i] in pnl_tracker.columns]
+            if not cols:
+                mat.loc[str(y), MONTH_NAMES[m-1]] = 0.0
+                continue
+            port = pnl_tracker[cols].sum(axis=1)
+
+            month_mask = (pnl_tracker.index.year == y) & (pnl_tracker.index.month == m)
+            idx_month = pnl_tracker.index[month_mask]
+            if len(idx_month) == 0:
+                mat.loc[str(y), MONTH_NAMES[m-1]] = 0.0
+                continue
+            start_dt = idx_month.min(); end_dt = idx_month.max()
+            v0 = float(port.loc[start_dt]) if start_dt in port.index else float(port.iloc[0])
+            v1 = float(port.loc[end_dt])   if end_dt   in port.index else float(port.iloc[-1])
+            mat.loc[str(y), MONTH_NAMES[m-1]] = v1 - v0
+
+    # Year total
+    mat["YearTotal"] = mat.sum(axis=1, numeric_only=True)
+
+    # Average row on top (only months; "YearTotal" average also shown)
+    avg = pd.DataFrame([mat.mean(axis=0, numeric_only=True)], index=["Average"])
+    mat2 = pd.concat([avg, mat], axis=0)
+
+    # Heatmap figure (style proche de ton exemple)
+    z = mat2[MONTH_NAMES].values.astype(float)
+    text_vals = np.where(np.isfinite(z), np.round(z, 1), np.nan)
+    palette = [
+        [0.0,  "#7f0000"],
+        [0.2,  "#d7301f"],
+        [0.4,  "#fc8d59"],
+        [0.5,  "#f7f7f7"],
+        [0.6,  "#c7e9c0"],
+        [0.8,  "#1a9850"],
+        [1.0,  "#00441b"]
+    ]
+    fig = go.Figure(data=go.Heatmap(
+        z=z,
+        x=MONTH_NAMES,
+        y=list(mat2.index),
+        colorscale=palette,
+        zmid=0,
+        colorbar=dict(title="PnL (k€)"),
+        text=text_vals,
+        texttemplate="%{text}",
+        textfont={"color":"black","size":12},
+        hovertemplate="<b>%{y}</b> — %{x}<br>PnL: %{z:.1f} k€<extra></extra>",
+    ))
+    fig.update_layout(
+        template="plotly_white",
+        title="Monthly PnL heatmap (portfolio of trades entered in that month)",
+        xaxis=dict(side="top", tickangle=0),
+        yaxis=dict(autorange="reversed"),
+        margin=dict(l=60, r=20, t=50, b=40),
+    )
+    return fig, list(reversed(years)), mat2  # years asc for dropdown convenience
+
+def compute_trade_stats_table(trades_df: pd.DataFrame, master: pd.DataFrame, mode: str) -> pd.DataFrame:
+    """Return/Vol/Sharpe calculés sur l'underlier tradé pendant la vie du trade."""
+    if trades_df.empty:
+        return trades_df
+
+    x_col = "SPREAD_bps"; y_col = "BOX_bps"
+    rows = []
+    for _, r in trades_df.iterrows():
+        entry, exit_ = r["Entry"], r["Exit"]
+        side = +1 if r["Side"] == "LONG" else -1
+        entry_level = float(r["EntryLevel"])
+        b0 = float(r["Beta"])
+        ser = (master[y_col] - b0 * master[x_col]).dropna() if mode == MODE_PAIR else master[y_col].dropna()
+        path = ser.loc[(ser.index >= entry) & (ser.index <= exit_)].dropna()
+        if len(path) < 2:
+            ret_pct = 0.0; vol_pct = 0.0; sharpe = np.nan
+        else:
+            denom = max(abs(entry_level), 1e-9)
+            daily_pct = path.diff().dropna() / denom * 100.0
+            vol_pct = float(daily_pct.std())
+            # signed return (exit-entry)/entry, adjusted by trade side (PnL convention)
+            ret_pct = float((path.iloc[-1] - path.iloc[0]) / denom * 100.0) * (-side)
+            sharpe = (ret_pct / vol_pct) if vol_pct > 0 else np.nan
+        row = dict(r)
+        row.update({"ReturnPct": ret_pct, "VolPct": vol_pct, "Sharpe": sharpe})
+        rows.append(row)
+
+    keep = ["Mode","Side","Entry","Exit","Reason","Alpha","Beta","R2","ResidualAtEntry",
+            "EntryLevel","ExitLevel","PnL","ReturnPct","VolPct","Sharpe"]
+    out = pd.DataFrame(rows)[keep]
+    return out
+
+# =========================
+# Cache
+# =========================
+# ======== key now includes LOW entity as well ========
+_MASTER_CACHE: Dict[Tuple[str,str,str,str,int,str], pd.DataFrame] = {}
+def get_master_cached(country_high: str, country_low: str, long_m: str, short_m: str, window: int, spread_tenor_mode: str) -> Optional[pd.DataFrame]:
+    key = (country_high, country_low, long_m, short_m, int(window), spread_tenor_mode)
+    if key in _MASTER_CACHE:
+        return _MASTER_CACHE[key]
+    # if none of data & swap DFs are available -> None
+    if all(x is None for x in [data, df_ESTR, df_SWAP_3M, df_SWAP_6M]):
+        return None
+    m = build_master_dataframe(
+        data, country_high=country_high, country_low=country_low,
+        matu_long=long_m, matu_short=short_m, window=int(window),
+        curve_country=BENCHMARK_CURVE_COUNTRY, spread_tenor_mode=spread_tenor_mode
+    )
+    _MASTER_CACHE[key] = m
+    return m
+
+# =========================
+# App
+# =========================
+app: Dash = dash.Dash(__name__, suppress_callback_exceptions=True)
+app.title = "Box/Spread/CURVE — Dash"
+
+def build_entity_options(): return [{"label": c, "value": c} for c in ENTITIES]
+def build_maturity_options(): return [{"label": m, "value": m} for m in AVAILABLE_MATURITIES]
+
+app.layout = html.Div([
+    html.H2("📊 Box vs Spread/Curve — Regressions & Backtest"),
+    html.Div(id="warn-data", style={"color": "crimson", "marginBottom": "8px"}),
+
+    # Top selectors (universe + regression window + lookbacks)
+    html.Div([
+        html.Div([
+            html.Label("Entity (HIGH leg)"),
+            dcc.RadioItems(id="country", options=build_entity_options(),
+                           value=("Italy" if "Italy" in ENTITIES else ENTITIES[0]),
+                           inline=True),
+        ], style={"display": "inline-block", "marginRight": "24px"}),
+
+        # ======== NEW: choose the LOW leg / counterparty (can be swap) ========
+        html.Div([
+            html.Label("Counterparty (LOW leg)"),
+            dcc.RadioItems(id="country-low", options=build_entity_options(),
+                           value=("Germany" if "Germany" in ENTITIES else ENTITIES[0]),
+                           inline=True),
+        ], style={"display": "inline-block", "marginRight": "24px"}),
+        # ================================================================
+
+        html.Div([
+            html.Label("Long maturity"),
+            dcc.RadioItems(id="matu-long", options=build_maturity_options(),
+                           value=("10Y" if "10Y" in AVAILABLE_MATURITIES else AVAILABLE_MATURITIES[-1]),
+                           inline=True),
+        ], style={"display": "inline-block", "marginRight": "24px"}),
+
+        html.Div([
+            html.Label("Short maturity"),
+            dcc.RadioItems(id="matu-short", options=build_maturity_options(),
+                           value=("5Y" if "5Y" in AVAILABLE_MATURITIES else AVAILABLE_MATURITIES[0]),
+                           inline=True),
+        ], style={"display": "inline-block", "marginRight": "24px"}),
+
+        html.Div([
+            html.Label("Spread tenor used"),
+            dcc.RadioItems(
+                id="spread-tenor-mode",
+                options=[
+                    {"label": "10Y spread", "value": TENOR_10Y},
+                    {"label": "Long-leg spread", "value": TENOR_LONG},
+                ],
+                value=TENOR_LONG,
+                inline=True
+            ),
+        ], style={"display": "inline-block"})
+    ], style={"marginBottom": "12px"}),
+
+    html.Div([
+        html.Div([
+            html.Label("Rolling regression window"),
+            dcc.RadioItems(id="window", options=WINDOW_OPTIONS, value=DEFAULT_WINDOW, inline=True),
+        ], style={"display":"inline-block","marginRight":"24px"}),
+        html.Div([
+            html.Label("Lookback — plots (years)"),
+            dcc.Slider(id="lookback-plots", min=1, max=MAX_LOOKBACK_YEARS, step=1, value=DEFAULT_LOOKBACK_PLOTS,
+                       marks={i: str(i) for i in range(1, MAX_LOOKBACK_YEARS+1)}),
+        ], style({"display":"inline-block","width":"40%","verticalAlign":"top","marginRight":"24px"})),
+        html.Div([
+            html.Label("Lookback — backtest (years)"),
+            dcc.Slider(id="lookback-bt", min=1, max=MAX_LOOKBACK_YEARS, step=1, value=DEFAULT_LOOKBACK_BT,
+                       marks={i: str(i) for i in range(1, MAX_LOOKBACK_YEARS+1)}),
+        ], style({"display":"inline-block","width":"40%","verticalAlign":"top"})),
+    ]),
+
+    html.Div(id="warn-maturity", style={"color": "crimson", "margin": "8px 0"}),
+
+    html.Hr(),
+
+    # ==================== Section 1: Levels ~ Spread ====================
+    html.H3(id="title-lvs", style={"marginBottom":"6px"}),
+    html.Div([
+        html.Div([dcc.Graph(id="fig_lvs_r2",   config={"displaylogo": False})], style={"width": "49%", "display": "inline-block"}),
+        html.Div([dcc.Graph(id="fig_lvs_beta", config={"displaylogo": False})], style={"width": "49%", "display": "inline-block"}),
+    ]),
+    dcc.Graph(id="fig_lvs_resid", config={"displaylogo": False}),
+    html.Div([
+        html.Div([dcc.Graph(id="fig_lvs_scatter_all", config={"displaylogo": False})],
+                 style={"width":"49%","display":"inline-block"}),
+        html.Div([dcc.Graph(id="fig_lvs_scatter_r2",  config={"displaylogo": False})],
+                 style={"width":"49%","display":"inline-block"}),
+    ]),
+
+    html.Hr(),
+
+    # ==================== Section 2: Levels ~ Curve ====================
+    html.H3(id="title-lvc", style={"marginBottom":"6px"}),
+    html.Div(id="curve-note", style={"fontStyle":"italic", "color":"#555", "marginBottom":"8px"}),
+    html.Div([
+        html.Div([dcc.Graph(id="fig_lvc_r2",   config={"displaylogo": False})], style={"width": "49%", "display": "inline-block"}),
+        html.Div([dcc.Graph(id="fig_lvc_beta", config={"displaylogo": False})], style={"width": "49%", "display": "inline-block"}),
+    ]),
+    dcc.Graph(id="fig_lvc_resid", config={"displaylogo": False}),
+    html.Div([
+        html.Div([dcc.Graph(id="fig_lvc_scatter_all", config={"displaylogo": False})],
+                 style={"width":"49%","display":"inline-block"}),
+        html.Div([dcc.Graph(id="fig_lvc_scatter_r2",  config={"displaylogo": False})],
+                 style={"width":"49%","display":"inline-block"}),
+    ]),
+
+    html.Hr(),
+
+    # ==================== Section 3: Δ ~ Δ ====================
+    html.H3(id="title-dvs", style={"marginBottom":"6px"}),
+    html.Div([
+        html.Div([dcc.Graph(id="fig_dvs_r2",   config={"displaylogo": False})], style={"width": "49%", "display": "inline-block"}),
+        html.Div([dcc.Graph(id="fig_dvs_beta", config={"displaylogo": False})], style={"width": "49%", "display": "inline-block"}),
+    ]),
+    dcc.Graph(id="fig_dvs_resid", config={"displaylogo": False}),
+    html.Div([
+        html.Div([dcc.Graph(id="fig_dvs_scatter_all", config={"displaylogo": False})],
+                 style={"width":"49%","display":"inline-block"}),
+        html.Div([dcc.Graph(id="fig_dvs_scatter_r2",  config={"displaylogo": False})],
+                 style={"width":"49%","display":"inline-block"}),
+    ]),
+
+    html.Hr(),
+
+    # ==================== Section 4: Backtest ====================
+    html.H3("4) Backtest", style={"marginBottom":"6px"}),
+    html.Div([
+        html.Div([
+            html.Label("Mode"),
+            dcc.RadioItems(
+                id="bt-mode",
+                options=[
+                    {"label": "BOX only", "value": MODE_BOX},
+                    {"label": "PAIR (Box − β×Spread)", "value": MODE_PAIR},
+                ],
+                value=MODE_BOX, inline=True
+            )
+        ], style={"display": "inline-block", "marginRight": "24px"}),
+    ], style={"marginBottom": "6px"}),
+
+    # Backtest PARAMS (tous ici)
+    html.Div([
+        html.Div([
+            html.Label("Obs delay L (days)"),
+            dcc.RadioItems(id="obs", options=[
+                {"label":"1M (21)", "value":21},
+                {"label":"2M (42)", "value":42},
+                {"label":"3M (63)", "value":63},
+                {"label":"6M (126)", "value":126},
+            ], value=21, inline=True),
+        ], style={"display":"inline-block","marginRight":"24px"}),
+
+        html.Div([
+            html.Label("Holding H (days)"),
+            dcc.RadioItems(id="hold", options=[
+                {"label":"1M (21)", "value":21},
+                {"label":"2M (42)", "value":42},
+                {"label":"3M (63)", "value":63},
+                {"label":"6M (126)", "value":126},
+            ], value=21, inline=True),
+        ], style={"display":"inline-block","marginRight":"24px"}),
+
+        html.Div([
+            html.Label("Cooldown (no new entry)"),
+            dcc.Slider(id="cooldown", min=0, max=30, step=1, value=DEFAULT_COOLDOWN,
+                       marks={i: str(i) for i in range(0, 31, 5)}),
+        ], style({"display":"inline-block","width":"22%","verticalAlign":"top","marginRight":"16px"})),
+        html.Div([
+            html.Label("R² threshold (scatter)"),
+            dcc.Slider(id="r2-scatter", min=0.0, max=1.0, step=0.05, value=DEFAULT_R2_SCATTER,
+                       marks={i/10: f"{i/10:.1f}" for i in range(0, 11)}),
+        ], style({"display":"inline-block","width":"22%","verticalAlign":"top","marginRight":"16px"})),
+        html.Div([
+            html.Label("R² threshold (backtest)"),
+            dcc.Slider(id="r2-bt", min=0.0, max=1.0, step=0.05, value=DEFAULT_R2_BACKTEST,
+                       marks={i/10: f"{i/10:.1f}" for i in range(0, 11)}),
+        ], style({"display":"inline-block","width":"22%","verticalAlign":"top"})),
+    ], style={"margin":"6px 0"}),
+
+    html.Div([
+        html.Div([
+            html.Label("|ε| threshold (bps)"),
+            dcc.Slider(id="eps", min=0.0, max=5.0, step=0.1, value=DEFAULT_EPS_THR,
+                       marks={i: str(i) for i in range(0, 6)}),
+        ], style({"display":"inline-block","width":"30%","verticalAlign":"top","marginRight":"16px"})),
+        html.Div([
+            html.Label("TP mult × ε"),
+            dcc.Slider(id="tp", min=0.0, max=1.0, step=0.05, value=DEFAULT_TP_MULT,
+                       marks={i/20: f"{i/20:.2f}" for i in range(0, 21, 5)}),
+        ], style({"display":"inline-block","width":"30%","verticalAlign":"top","marginRight":"16px"})),
+        html.Div([
+            html.Label("SL mult × ε"),
+            dcc.Slider(id="sl", min=0.0, max=1.0, step=0.05, value=DEFAULT_SL_MULT,
+                       marks={i/20: f"{i/20:.2f}" for i in range(0, 21, 5)}),
+        ], style({"display":"inline-block","width":"30%","verticalAlign":"top"})),
+    ], style={"marginBottom":"10px"}),
+
+    html.Div(id="bt-bullets", style={"marginBottom":"10px","fontSize":"13px"}),
+
+    html.Div([
+        html.Div([dcc.Graph(id="fig_pnl_real", config={"displaylogo": False})], style={"width": "49%", "display": "inline-block"}),
+        html.Div([dcc.Graph(id="fig_pnl_mtm",  config={"displaylogo": False})], style({"width": "49%", "display": "inline-block"})),
+    ]),
+
+    html.H4("Monthly PnL heatmap (by entry month within backtest window)"),
+    dcc.Graph(id="fig_heatmap", config={"displaylogo": False}),
+    html.Div(id="heatmap-note", style={"color":"#777", "fontStyle":"italic", "marginBottom":"8px"}),
+
+    html.Div([
+        html.Label("Inspect trades for year"),
+        dcc.Dropdown(id="year-select", options=[], value=None, clearable=False, style={"width":"220px"}),
+    ], style({"margin":"8px 0"})),
+
+    dash_table.DataTable(
+        id="trades-table",
+        columns=[
+            {"name":"Mode","id":"Mode"},
+            {"name":"Side","id":"Side"},
+            {"name":"Entry","id":"Entry","type":"datetime"},
+            {"name":"Exit","id":"Exit","type":"datetime"},
+            {"name":"Reason","id":"Reason"},
+            {"name":"Alpha","id":"Alpha","type":"numeric","format":dict(specifier=".3f")},
+            {"name":"Beta","id":"Beta","type":"numeric","format":dict(specifier=".3f")},
+            {"name":"R2","id":"R2","type":"numeric","format":dict(specifier=".3f")},
+            {"name":"ResidualAtEntry","id":"ResidualAtEntry","type":"numeric","format":dict(specifier=".2f")},
+            {"name":"EntryLevel","id":"EntryLevel","type":"numeric","format":dict(specifier=".2f")},
+            {"name":"ExitLevel","id":"ExitLevel","type":"numeric","format":dict(specifier=".2f")},
+            {"name":"PnL","id":"PnL","type":"numeric","format":dict(specifier:".1f")},
+            {"name":"Return %","id":"ReturnPct","type":"numeric","format":dict(specifier:".2f")},
+            {"name":"Vol %","id":"VolPct","type":"numeric","format":dict(specifier:".2f")},
+            {"name":"Sharpe","id":"Sharpe","type":"numeric","format":dict(specifier:".2f")},
+        ],
+        data=[], page_size=12, style_table={"overflowX":"auto"},
+        style_cell={"fontFamily":"Montserrat, Arial", "fontSize":"12px", "padding":"6px"},
+        sort_action="native",
+    ),
+
+    dcc.Store(id="store-trades"),
+    dcc.Store(id="store-pnl"),
+
+    html.Div(id="warn-end", style={"color": "#777", "marginTop": "8px", "fontStyle":"italic"})
+])
+
+# =========================
+# Small figure helpers (no long titles)
+# =========================
+def fig_ts(y: pd.Series, title: Optional[str], ylab: str) -> go.Figure:
+    y = y.dropna()
+    fig = go.Figure()
+    if not y.empty:
+        fig.add_trace(go.Scatter(x=y.index, y=y.values, mode="lines", name=ylab))
+    if title:
+        fig.update_layout(title=title)
+    fig.update_layout(template="plotly_white",
+                      xaxis=dict(tickformat="%Y"),
+                      yaxis=dict(title=ylab),
+                      margin=dict(l=50, r=20, t=40, b=40),
+                      legend=dict(orientation="h", y=1.02, x=1, xanchor="right"))
+    return fig
+
+def fig_scatter_heatmap_with_poly(
+    x: pd.Series, y: pd.Series, index: pd.DatetimeIndex,
+    title: Optional[str], xlab: str, ylab: str, poly_deg: int = 2
+) -> go.Figure:
+    dfp = pd.DataFrame({"x": x, "y": y}, index=pd.to_datetime(index)).dropna()
+    fig = go.Figure()
+    if title:
+        fig.update_layout(title=title)
+    fig.update_layout(xaxis_title=xlab, yaxis_title=ylab, template="plotly_white",
+                      margin=dict(l=50, r=70, t=40, b=40),
+                      legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+    if dfp.empty:
+        return fig
+    years = dfp.index.year
+    cmin, cmax = int(years.min()), int(years.max())
+    fig.add_trace(go.Scatter(
+        x=dfp["x"], y=dfp["y"], mode="markers",
+        marker=dict(size=6, color=years, colorscale="RdBu_r", cmin=cmin, cmax=cmax, showscale=True,
+                    colorbar=dict(title="Year", x=1.02)),
+        hovertemplate="x=%{x:.3f}<br>y=%{y:.3f}<extra></extra>",
+        showlegend=False
+    ))
+    if len(dfp) >= (poly_deg + 1):
+        try:
+            xs = dfp["x"].values; ys = dfp["y"].values
+            order = np.argsort(xs)
+            xs_sorted, ys_sorted = xs[order], ys[order]
+            coeffs = np.polyfit(xs_sorted, ys_sorted, deg=poly_deg)
+            x_line = np.linspace(xs_sorted.min(), xs_sorted.max(), 300)
+            y_line = np.polyval(coeffs, x_line)
+            fig.add_trace(go.Scatter(x=x_line, y=y_line, mode="lines", name=f"Poly fit (deg={poly_deg})",
+                                     hoverinfo="skip"))
+        except Exception:
+            pass
+    return fig
+
+def fig_scatter_beta_year_heat(
+    master: pd.DataFrame, beta_col: str, x_level_col: str,
+    r2_col: Optional[str] = None, r2_min: Optional[float] = None,
+    title: Optional[str] = None, xlab: str = "Level (bps)", ylab: str = "Beta",
+) -> go.Figure:
+    cols = [beta_col, x_level_col]
+    if r2_col: cols.append(r2_col)
+    df = master[cols].dropna()
+    if r2_col and (r2_min is not None):
+        df = df[df[r2_col] >= float(r2_min)]
+    if df.empty:
+        return go.Figure(layout=go.Layout(template="plotly_white", margin=dict(l=50,r=20,t=30,b=40)))
+    return fig_scatter_heatmap_with_poly(df[x_level_col], df[beta_col], df.index, title, xlab, ylab, poly_deg=2)
+
+# =========================
+# Callback principal
+# =========================
+@app.callback(
+    Output("warn-data", "children"),
+    Output("warn-maturity", "children"),
+    Output("title-lvs", "children"),
+    Output("title-lvc", "children"),
+    Output("title-dvs", "children"),
+    Output("curve-note", "children"),
+
+    Output("fig_lvs_r2", "figure"),
+    Output("fig_lvs_beta", "figure"),
+    Output("fig_lvs_resid", "figure"),
+    Output("fig_lvs_scatter_all", "figure"),
+    Output("fig_lvs_scatter_r2", "figure"),
+
+    Output("fig_lvc_r2", "figure"),
+    Output("fig_lvc_beta", "figure"),
+    Output("fig_lvc_resid", "figure"),
+    Output("fig_lvc_scatter_all", "figure"),
+    Output("fig_lvc_scatter_r2", "figure"),
+
+    Output("fig_dvs_r2", "figure"),
+    Output("fig_dvs_beta", "figure"),
+    Output("fig_dvs_resid", "figure"),
+    Output("fig_dvs_scatter_all", "figure"),
+    Output("fig_dvs_scatter_r2", "figure"),
+
+    Output("fig_pnl_real", "figure"),
+    Output("fig_pnl_mtm", "figure"),
+    Output("bt-bullets", "children"),
+
+    Output("store-trades", "data"),
+    Output("store-pnl", "data"),
+    Output("warn-end", "children"),
+
+    Input("country", "value"),
+    Input("country-low", "value"),  # NEW
+    Input("matu-long", "value"),
+    Input("matu-short", "value"),
+    Input("spread-tenor-mode", "value"),
+    Input("window", "value"),
+
+    Input("lookback-plots", "value"),
+    Input("lookback-bt", "value"),
+
+    # BACKTEST params (section 4)
+    Input("obs", "value"),
+    Input("hold", "value"),
+    Input("cooldown", "value"),
+    Input("r2-scatter", "value"),
+    Input("r2-bt", "value"),
+    Input("eps", "value"),
+    Input("tp", "value"),
+    Input("sl", "value"),
+    Input("bt-mode", "value"),
+)
+def update_all(country_high, country_low, m_long, m_short, spread_mode, window,
+               lookback_plots, lookback_bt,
+               obs, hold, cooldown, r2_scatter, r2_bt, eps_thr, tp_mult, sl_mult, bt_mode):
+
+    empty = go.Figure(); empty.update_layout(template="plotly_white")
+
+    if all(x is None for x in [data, df_ESTR, df_SWAP_3M, df_SWAP_6M]):
+        return ("No market data found (`data` / `df_ESTR` / `df_SWAP_3M` / `df_SWAP_6M`).",
+                "", "", "", "", "",
+                empty, empty, empty, empty, empty,
+                empty, empty, empty, empty, empty,
+                empty, empty, empty, empty, empty,
+                empty, empty, html.Ul([]), None, None, "")
+
+    warn_m = ""
+    if country_high not in ENTITIES:
+        country_high = ENTITIES[0]
+    if country_low not in ENTITIES:
+        country_low = "Germany" if "Germany" in ENTITIES else ENTITIES[0]
+    if (m_long not in AVAILABLE_MATURITIES) or (m_short not in AVAILABLE_MATURITIES):
+        warn_m = "Select valid maturities."
+        return ("", warn_m, "", "", "", "",
+                empty, empty, empty, empty, empty,
+                empty, empty, empty, empty, empty,
+                empty, empty, empty, empty, empty,
+                empty, empty, html.Ul([]), None, None, "")
+
+    try:
+        Lnum = int(m_long.replace("Y",""))
+        Snum = int(m_short.replace("Y",""))
+    except Exception:
+        warn_m = "Maturity parsing error."
+        return ("", warn_m, "", "", "", "",
+                empty, empty, empty, empty, empty,
+                empty, empty, empty, empty, empty,
+                empty, empty, empty, empty, empty,
+                empty, empty, html.Ul([]), None, None, "")
+
+    if Lnum <= Snum:
+        warn_m = "⚠️ Long maturity must be strictly greater than Short maturity."
+
+    master_full = get_master_cached(country_high, country_low, m_long, m_short, int(window), spread_mode)
+    if master_full is None or master_full.empty:
+        return ("", warn_m or "No data for this selection.", "", "", "", "",
+                empty, empty, empty, empty, empty,
+                empty, empty, empty, empty, empty,
+                empty, empty, empty, empty, empty,
+                empty, empty, html.Ul([]), None, None, "")
+
+    master_plots = slice_by_years(master_full, int(lookback_plots))
+    master_bt    = slice_by_years(master_full,  int(lookback_bt))
+
+    w = int(window)
+    lvs_r2, lvs_beta, lvs_res = f"lvl_spread_r2_w{w}", f"lvl_spread_beta_w{w}", f"lvl_spread_resid_w{w}"
+    lvc_r2, lvc_beta, lvc_res = f"lvl_curve_r2_w{w}", f"lvl_curve_beta_w{w}", f"lvl_curve_resid_w{w}"
+    dvs_r2, dvs_beta, dvs_res = f"chg_spread_r2_w{w}", f"chg_spread_beta_w{w}", f"chg_spread_resid_w{w}"
+
+    boxname = box_label(country_high, country_low, m_short, m_long)
+    spread_used = spread_tenor_label(spread_mode, m_long)
+
+    # Short, clear section titles
+    title_lvs = f"1) BOX vs SPREAD — tenor {spread_used} — {boxname}"
+    title_lvc = f"2) BOX vs CURVE (DE {m_short}s{m_long}) — {boxname}"
+    title_dvs = f"3) ΔBOX vs ΔSPREAD — tenor {spread_used} — {boxname}"
+    curve_note = f"Curve used = {BENCHMARK_CURVE_COUNTRY} {m_short}s{m_long} (i.e., {m_long} − {m_short})"
+
+    # Build figures (no long figure titles; rely on H3)
+    fig_lvs_r2   = fig_ts(master_plots[lvs_r2],   None, "R²")
+    fig_lvs_beta = fig_ts(master_plots[lvs_beta], None, "Beta")
+    fig_lvs_res  = fig_ts(master_plots[lvs_res],  None, "Residual (bps)")
+    fig_lvs_sc_all = fig_scatter_beta_year_heat(
+        master_plots, beta_col=lvs_beta, x_level_col="SPREAD_bps",
+        title=f"β vs SPREAD level — ALL — tenor {spread_used}", xlab="Spread (bps)", ylab="Beta"
+    )
+    fig_lvs_sc_r2  = fig_scatter_beta_year_heat(
+        master_plots, beta_col=lvs_beta, x_level_col="SPREAD_bps", r2_col=lvs_r2, r2_min=float(r2_scatter),
+        title=f"β vs SPREAD level — R² ≥ {float(r2_scatter):.2f} — tenor {spread_used}",
+        xlab="Spread (bps)", ylab="Beta"
+    )
+
+    fig_lvc_r2   = fig_ts(master_plots[lvc_r2],   None, "R²")
+    fig_lvc_beta = fig_ts(master_plots[lvc_beta], None, "Beta")
+    fig_lvc_res  = fig_ts(master_plots[lvc_res],  None, "Residual (bps)")
+    fig_lvc_sc_all = fig_scatter_beta_year_heat(
+        master_plots, beta_col=lvc_beta, x_level_col="CURVE_bps",
+        title="β vs CURVE level — ALL", xlab="Curve (bps)", ylab="Beta"
+    )
+    fig_lvc_sc_r2  = fig_scatter_beta_year_heat(
+        master_plots, beta_col=lvc_beta, x_level_col="CURVE_bps", r2_col=lvc_r2, r2_min=float(r2_scatter),
+        title=f"β vs CURVE level — R² ≥ {float(r2_scatter):.2f}", xlab="Curve (bps)", ylab="Beta"
+    )
+
+    fig_dvs_r2   = fig_ts(master_plots[dvs_r2],   None, "R²")
+    fig_dvs_beta = fig_ts(master_plots[dvs_beta], None, "Beta")
+    fig_dvs_res  = fig_ts(master_plots[dvs_res],  None, "Residual (bps)")
+    fig_dvs_sc_all = fig_scatter_beta_year_heat(
+        master_plots, beta_col=dvs_beta, x_level_col="SPREAD_bps",
+        title=f"β(Δ) vs SPREAD level — ALL — tenor {spread_used}",
+        xlab="Spread (bps)", ylab="Beta (Δ)"
+    )
+    fig_dvs_sc_r2  = fig_scatter_beta_year_heat(
+        master_plots, beta_col=dvs_beta, x_level_col="SPREAD_bps", r2_col=dvs_r2, r2_min=float(r2_scatter),
+        title=f"β(Δ) vs SPREAD level — R² ≥ {float(r2_scatter):.2f} — tenor {spread_used}",
+        xlab="Spread (bps)", ylab="Beta (Δ)"
+    )
+
+    # Backtest
+    trades_df, pnl_tracker = backtest_from_master(
+        master_bt, window=w, obs_window_days=int(obs), holding_days=int(hold),
+        resid_threshold=float(eps_thr), r2_entry_threshold=float(r2_bt),
+        tp_mult=float(tp_mult), sl_mult=float(sl_mult),
+        dv01_k=DV01_K, driver="SPREAD",
+        cooldown_days=int(cooldown), mode=bt_mode
+    )
+
+    if trades_df.empty:
+        fig_pnl_real = go.Figure(); fig_pnl_real.update_layout(title="Realized Cum PnL (by Exit) — No trades", template="plotly_white")
+        fig_pnl_mtm  = go.Figure(); fig_pnl_mtm.update_layout(title="Portfolio MtM PnL — No trades", template="plotly_white")
+    else:
+        y = trades_df.dropna(subset=["RealizedCumPnL_by_exit"])
+        fig_pnl_real = go.Figure()
+        fig_pnl_real.add_trace(go.Scatter(x=y["Exit"], y=y["RealizedCumPnL_by_exit"], mode="lines", name="CumPnL (k€)"))
+        fig_pnl_real.update_layout(title="Realized Cumulative PnL (by Exit)", template="plotly_white",
+                                   xaxis=dict(tickformat="%Y"), yaxis=dict(title="k€"),
+                                   margin=dict(l=50, r=20, t=40, b=40))
+        fig_pnl_mtm = go.Figure()
+        if not pnl_tracker.empty and "CumPnL" in pnl_tracker.columns:
+            fig_pnl_mtm.add_trace(go.Scatter(x=pnl_tracker.index, y=pnl_tracker["CumPnL"], mode="lines", name="CumPnL (k€)"))
+        fig_pnl_mtm.update_layout(title="Portfolio MtM PnL", template="plotly_white",
+                                  xaxis=dict(tickformat="%Y"), yaxis=dict(title="k€"),
+                                  margin=dict(l=50, r=20, t=40, b=40))
+
+    bullets = html.Ul([
+        html.Li(f"Signal ε = BOX − (α + β·Spread_{spread_used}). Entry if |ε| ≥ {float(eps_thr):.2f} bps & R² ≥ {float(r2_bt):.2f}."),
+        html.Li(f"Timing: window={w}d OLS, L={int(obs)}d delay, H={int(hold)}d max holding, cooldown={int(cooldown)}d."),
+        html.Li("Stops sur l’actif tradé: TP/SL = ±(mult × |ε|) sur BOX ou (BOX−β·SPREAD)."),
+        html.Li("Modes: BOX (long/short BOX) vs PAIR (long/short [BOX−β·SPREAD]) avec β gelé à l’entrée."),
+        html.Li(f"Spread tenor utilisé: {spread_used}. Box: {m_short.lower()}s{m_long} {country_high} vs {country_low}."),
+        html.Li(f"DV01 par trade = {DV01_K:.0f} k€; MtM du portefeuille = somme des MtM des trades vivants."),
+    ])
+
+    store_trades = trades_df.to_json(date_format="iso", orient="split") if not trades_df.empty else None
+    store_pnl    = pnl_tracker.to_json(date_format="iso", orient="split") if not pnl_tracker.empty else None
+    warn_end = f"Backtest lookback = {int(lookback_bt)}y | Plots lookback = {int(lookback_plots)}y."
+
+    return (
+        "", warn_m, title_lvs, title_lvc, title_dvs, curve_note,
+        fig_lvs_r2, fig_lvs_beta, fig_lvs_res, fig_lvs_scatter_all, fig_lvs_scatter_r2,
+        fig_lvc_r2, fig_lvc_beta, fig_lvc_res, fig_lvc_scatter_all, fig_lvc_scatter_r2,
+        fig_dvs_r2, fig_dvs_beta, fig_dvs_res, fig_dvs_scatter_all, fig_dvs_scatter_r2,
+        fig_pnl_real, fig_pnl_mtm, bullets,
+        store_trades, store_pnl, warn_end
+    )
+
+# =========================
+# Callback heatmap + table (depends only on stores + selectors)
+# =========================
+@app.callback(
+    Output("fig_heatmap", "figure"),
+    Output("heatmap-note", "children"),
+    Output("year-select", "options"),
+    Output("year-select", "value"),
+    Output("trades-table", "data"),
+
+    Input("store-trades", "data"),
+    Input("store-pnl", "data"),
+    Input("country", "value"),
+    Input("country-low", "value"),  # NEW
+    Input("matu-long", "value"),
+    Input("matu-short", "value"),
+    Input("spread-tenor-mode", "value"),
+    Input("bt-mode", "value"),
+    Input("year-select", "value")
+)
+def update_heatmap_and_table(store_trades, store_pnl, country_high, country_low, m_long, m_short, spread_mode, bt_mode, year_selected):
+    if not store_trades or not store_pnl:
+        return go.Figure(layout=go.Layout(template="plotly_white")), "", [], None, []
+
+    trades_df = pd.read_json(store_trades, orient="split")
+    pnl_tracker = pd.read_json(store_pnl, orient="split")
+
+    # master for stats table (same selection; window value doesn't matter for levels here)
+    master = get_master_cached(country_high, country_low, m_long, m_short, DEFAULT_WINDOW, spread_mode)
+    if master is None:
+        master = pd.DataFrame(index=pnl_tracker.index)
+
+    heatmap_fig, years_asc, mat = monthly_pnl_heatmap(trades_df, pnl_tracker)
+    note = ("Rows: Average + years (DESC in chart); Columns: months. "
+            "Each cell = PnL(k€) of a portfolio made ONLY of trades entered during that month "
+            "(end-of-month minus start-of-month).")
+
+    # Dropdown options use ascending years for natural reading
+    options = [{"label": str(y), "value": int(y)} for y in years_asc]
+    if (year_selected is None) or (year_selected not in years_asc):
+        year_selected = years_asc[-1] if years_asc else None
+
+    if year_selected is None:
+        table_data = []
+    else:
+        sub = trades_df[trades_df["Entry"].dt.year == int(year_selected)].copy()
+        sub_stats = compute_trade_stats_table(sub, master, bt_mode)
+        # Convert timestamps to ISO strings for DataTable
+        if not sub_stats.empty:
+            sub_stats["Entry"] = pd.to_datetime(sub_stats["Entry"]).dt.strftime("%Y-%m-%d")
+            sub_stats["Exit"]  = pd.to_datetime(sub_stats["Exit"]).dt.strftime("%Y-%m-%d")
+        table_data = sub_stats.to_dict("records")
+
+    return heatmap_fig, note, options, year_selected, table_data
+
+# =========================
+# Main
+# =========================
+if __name__ == "__main__":
+    import webbrowser, socket
+    def get_local_ip():
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80)); ip = s.getsockname()[0]
+        except Exception: ip = "127.0.0.1"
+        finally: s.close()
+        return ip
+
+    host, port = "0.0.0.0", 8053
+    local_ip = get_local_ip()
+    print("\n================= SHARE THIS =================")
+    print(f"Local (you) : http://localhost:{port}")
+    print(f"LAN (team)  : http://{local_ip}:{port}")
+    print("==============================================\n")
+    try: webbrowser.open(f"http://localhost:{port}")
+    except Exception: pass
+    app.run_server(host=host, port=port, debug=False)
